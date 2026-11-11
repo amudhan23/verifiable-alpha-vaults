@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/proofs", "contracts/vault", "strategy"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/amudhan23/verifiable-alpha-vaults"
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true

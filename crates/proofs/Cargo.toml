@@ -1,0 +1,32 @@
+[package]
+name = "vault-proofs"
+description = "Pedersen commitments + Bulletproofs range proofs for vault risk limits (leverage, drawdown)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bulletproofs = "4"
+curve25519-dalek-ng = { version = "4", default-features = false, features = ["u64_backend", "serde"] }
+merlin = "3"
+rand = "0.8"
+rand_core = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+thiserror = "1"
+
+# browser verification via wasm-bindgen (enabled with `--features wasm`)
+wasm-bindgen = { version = "0.2", optional = true }
+getrandom = { version = "0.2", optional = true, features = ["js"] }
+
+[features]
+default = []
+wasm = ["wasm-bindgen", "getrandom"]
+
+[dev-dependencies]
+rand_chacha = "0.3"

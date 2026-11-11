@@ -1,0 +1,6 @@
+[package]
+name = "vault-strategy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
