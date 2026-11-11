@@ -2572,6 +2572,8 @@ dependencies = [
  "near-sdk",
  "serde",
  "serde_json",
+ "vault-proofs",
+ "vault-strategy",
 ]
 
 [[package]]
@@ -2595,6 +2597,14 @@ dependencies = [
 [[package]]
 name = "vault-strategy"
 version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "vault-proofs",
+]
 
 [[package]]
 name = "version_check"

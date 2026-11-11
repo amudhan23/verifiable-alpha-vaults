@@ -17,3 +17,5 @@ hex = "0.4"
 
 [dev-dependencies]
 near-sdk = { version = "5", features = ["unit-testing"] }
+vault-strategy = { path = "../../strategy" }
+vault-proofs = { path = "../../crates/proofs" }
