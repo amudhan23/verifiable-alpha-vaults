@@ -127,10 +127,16 @@ details and live contract addresses land here once deployed.)
   attestation chain (source → WASM hash → input hash → output hash → TDX
   quote) is independently checkable; the worker image, once approved in the
   registry, is trusted to run the WASM it names.
-- **On-chain verification** covers code-hash matching, commitment ordering,
-  and guardrails. Full TDX quote verification and Bulletproof verification
-  happen client-side (browser WASM) — on-chain verification of either is gas-
-  prohibitive and unnecessary for the guarantee.
+- **On-chain** (enforced by the vault): code-hash match, enclave-input state
+  consistency (no doctored NAV), commitment ordering, guardrails, liveness-based
+  emergency exit. **Hardware attestation on-chain** arrives via OutLayer's
+  yield/resume path (built: `request_decision`; only DCAP-verified worker keys
+  can resolve it). The testnet worker hasn't served it yet, so live cycles use
+  HTTPS, with attestations verified by anyone off-chain. See
+  `docs/DEPLOYMENT.md` → "Attestation verification".
+- **Exit guarantees:** if no attested decision lands for 24h, anyone can
+  trigger a one-way emergency exit; withdrawals pay the NEAR pool pro rata and
+  record claims on cross-chain value. The MPC path rotation is timelocked 48h.
 - **The enclave is not the enforcement point.** Even a malicious strategy
   (or malicious parameters) cannot exceed the guardrails: the contract checks
   every reveal before an execution signature exists.

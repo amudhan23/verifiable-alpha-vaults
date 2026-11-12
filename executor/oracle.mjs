@@ -12,10 +12,14 @@ const PYTH_IDS = {
 };
 const CG = "https://api.coingecko.com/api/v3";
 
-async function getJson(url) {
-  const res = await fetch(url, { headers: { accept: "application/json" } });
-  if (!res.ok) throw new Error(`${res.status} ${url}`);
-  return res.json();
+async function getJson(url, tries = 3) {
+  for (let i = 0; ; i++) {
+    const res = await fetch(url, { headers: { accept: "application/json" } });
+    if (res.ok) return res.json();
+    // free-tier rate limits (429) are common: back off and retry
+    if (i + 1 >= tries || (res.status !== 429 && res.status < 500)) throw new Error(`${res.status} ${url}`);
+    await new Promise((r) => setTimeout(r, 2000 * 2 ** i));
+  }
 }
 
 async function pythSpot() {

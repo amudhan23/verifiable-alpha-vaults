@@ -89,3 +89,12 @@ Now:
 - First live commitment on this basis: #12 (`basis: positions`).
 
 **Stated plainly:** when every position sits on a public chain, these metrics are recomputable by anyone, so the Bulletproof's *hiding* adds little; its value here is a uniform, verifiable bound. Hiding matters for positions that are **not** public: exchange accounts whose API keys live in the enclave (roadmap). There, the same proof shows limits held without revealing the book. Path risk *between* runs is still unobserved; run cadence bounds it.
+
+## Attestation verification: where it happens, honestly (12 Nov)
+
+Investigated against OutLayer's TEE docs and the testnet register contract:
+
+- **On-chain verification exists, at worker registration.** `worker.outlayer.testnet.register_worker` verifies each worker's TDX quote with Intel's DCAP QVL library, checks its five measurements, and records the worker's public key; only that key may call `resolve_execution`. **So results delivered through the on-chain path are attested by construction**: no relayer can forge them. Our `request_decision` uses exactly this path (build pinned, result encrypted).
+- **Testnet reality:** the testnet worker has not resumed on-chain requests within NEAR's yield window in **4 attempts** (latest tx `C9HBsfuh…`, 12 Nov), while the HTTPS path answers in <1s. Live cycles therefore use HTTPS. When the worker serves yield/resume, the vault switches with no code changes. We've asked the OutLayer team.
+- **HTTPS path today:** the browser fetches each attestation, checks the executed wasm against the vault's record, and checks the published input against the attested `input_hash`. We confirmed the quote's MRTD is in the on-chain approved-measurements list (129 entries). Recomputing the quote's `report_data` Task Hash from the documented formula did **not** reproduce from the public API fields (an encoding detail we couldn't pin down), so we do **not** claim a full quote→hash binding in-browser. That remains: Task-Hash recompute + Intel signature-chain verification (dcap-qvl → wasm) client-side.
+- **Bottom line:** the contract enforces code hash, input-state consistency, commitment ordering, and guardrails on-chain. Full hardware-attestation enforcement on-chain arrives with the yield/resume path (already built); until then it's verified off-chain by anyone.
