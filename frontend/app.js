@@ -33,7 +33,7 @@ async function loadData() {
     try {
       data.vaults.unshift(await new LiveVault(id, RPC_URL).load());
       const mode = document.getElementById("mode");
-      if (mode) mode.textContent = "live + demo · NEAR testnet";
+      if (mode) mode.textContent = "live + demo records";
     } catch (e) {
       data.liveError = `couldn't reach ${id}: ${e.message}`;
     }
@@ -56,6 +56,20 @@ function chip(state, label) {
   const cls = { ok: "ok", bad: "bad", wait: "wait" }[state] || "wait";
   return `<span class="chip ${cls}"><span class="dot"></span>${esc(label)}</span>`;
 }
+let stampSeq = 0;
+function stamp(state, word) {
+  const color = { ok: "var(--verified)", bad: "var(--void)", wait: "var(--wax)" }[state];
+  const id = "ring" + stampSeq++;
+  const micro = "· VERIFIABLE · ALPHA · VAULTS · NEAR ".repeat(2);
+  return `<svg class="stamp slam" viewBox="0 0 100 100" role="img" aria-label="${esc(word)}">
+    <circle cx="50" cy="50" r="47" fill="none" stroke="${color}" stroke-width="2.6"/>
+    <circle cx="50" cy="50" r="34" fill="none" stroke="${color}" stroke-width="0.9"/>
+    <defs><path id="${id}" d="M50,50 m-40.5,0 a40.5,40.5 0 1,1 81,0 a40.5,40.5 0 1,1 -81,0"/></defs>
+    <text font-size="5.4" letter-spacing="1.25" fill="${color}" font-family="var(--mono)"><textPath href="#${id}">${micro}</textPath></text>
+    <text x="50" y="54.5" text-anchor="middle" font-family="Fraunces, serif" font-weight="700" font-size="${word.length > 8 ? 10.5 : 13}" letter-spacing="0.06em" fill="${color}">${esc(word)}</text>
+  </svg>`;
+}
+
 const copyBtn = (value) =>
   `<button class="copy" data-copy="${esc(value)}" title="Copy" aria-label="Copy to clipboard">copy</button>`;
 
@@ -69,7 +83,7 @@ function sparkline(hist, w = 220, h = 36) {
     .join(" ");
   const up = navs[navs.length - 1] >= navs[0];
   return `<svg class="spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="NAV history">
-    <polyline points="${pts}" fill="none" stroke="${up ? "var(--proven)" : "var(--failed)"}" stroke-width="1.6"/></svg>`;
+    <polyline points="${pts}" fill="none" stroke="${up ? "var(--verified)" : "var(--void)"}" stroke-width="1.6"/></svg>`;
 }
 
 function navChart(v, w = 560, h = 190) {
@@ -85,12 +99,12 @@ function navChart(v, w = 560, h = 190) {
   const t = (i) => new Date(hist[i].t).toISOString().slice(11, 16);
   return `<svg width="100%" viewBox="0 0 ${w} ${h}" role="img" aria-label="NAV over time">
     ${[min, (min + max) / 2, max]
-      .map((val) => `<line x1="8" x2="${w - 56}" y1="${py(val)}" y2="${py(val)}" stroke="var(--line)"/>
-        <text x="${w - 50}" y="${py(val) + 4}" fill="var(--muted)" font-size="11" font-family="var(--mono)">${val.toFixed(1)}</text>`)
+      .map((val) => `<line x1="8" x2="${w - 56}" y1="${py(val)}" y2="${py(val)}" stroke="var(--rule)"/>
+        <text x="${w - 50}" y="${py(val) + 4}" fill="var(--ink-2)" font-size="11" font-family="var(--mono)">${val.toFixed(1)}</text>`)
       .join("")}
-    <text x="8" y="${h - 8}" fill="var(--muted)" font-size="11" font-family="var(--mono)">${t(0)} UTC</text>
-    <text x="${w - 110}" y="${h - 8}" fill="var(--muted)" font-size="11" font-family="var(--mono)">${t(hist.length - 1)} UTC</text>
-    <polyline points="${pts}" fill="none" stroke="var(--text)" stroke-width="1.8"/>
+    <text x="8" y="${h - 8}" fill="var(--ink-2)" font-size="11" font-family="var(--mono)">${t(0)} UTC</text>
+    <text x="${w - 110}" y="${h - 8}" fill="var(--ink-2)" font-size="11" font-family="var(--mono)">${t(hist.length - 1)} UTC</text>
+    <polyline points="${pts}" fill="none" stroke="var(--ink)" stroke-width="1.6"/>
   </svg>`;
 }
 
@@ -113,7 +127,7 @@ async function renderLeaderboard() {
       const rejected = v.commitments.filter((c) => c.status === "Rejected").length;
       const codeLabel = { ok: "code attested", bad: "code mismatch", wait: "code unchecked" }[code.state];
       return `<a class="ledger-row" href="#/vault/${encodeURIComponent(v.id)}">
-        <span class="vault-name">${esc(v.name)}${v.live ? ` <span class="chip ok" style="margin-left:6px"><span class="dot"></span>live</span>` : ""}<small>${esc(v.id)}</small></span>
+        <span class="vault-name">${esc(v.name)}${v.live ? ` <span class="chip ok" style="margin-left:6px"><span class="dot"></span>live</span>` : ""}${v.name === v.id ? "" : `<small>${esc(v.id)}</small>`}</span>
         <span class="spark-cell">${sparkline(v.nav_history)}</span>
         <span class="ret ${v.return_pct == null || Math.abs(v.return_pct) < 0.005 ? "muted" : v.return_pct >= 0 ? "v-ok" : "v-bad"}">${fmtPct(v.return_pct)}</span>
         <span class="badges">
@@ -127,12 +141,12 @@ async function renderLeaderboard() {
 
   $("#view").innerHTML = `
     ${data.liveError ? `<div class="alert" style="border-left-color:var(--pending); border-color:var(--pending-dim)">Live mode: ${esc(data.liveError)} — showing demo vaults.</div>` : ""}
-    <h2 id="page-h" tabindex="-1">Vaults</h2>
+    <h2 id="page-h" tabindex="-1">The Registry</h2>
     <div class="ledger">
       <div class="ledger-head"><span>Vault</span><span>NAV</span><span style="text-align:right">Return</span><span style="text-align:right">Verification</span></div>
       ${rows}
     </div>
-    <p class="muted" style="margin-top:12px">Chips summarize on-chain state. Open a vault and run the checks yourself — verification happens in your browser, not on a server.</p>`;
+    <p class="muted" style="margin-top:12px; font-style:italic">Seals summarize on-chain state. Open a vault and examine it yourself — the stamps are earned in your browser, never issued by a server.</p>`;
 }
 
 // ----------------------------------------------------------------- vault page
@@ -180,7 +194,7 @@ async function renderVault(id) {
     <div class="vault-head">
       <div>
         <h2 id="page-h" tabindex="-1">${esc(v.name)}</h2>
-        <div class="sub">${esc(v.id)} · strategy ${short(v.approved_wasm_hash)} ${copyBtn(v.approved_wasm_hash)}</div>
+        <div class="sub">serial ${esc(v.id)} · strategy ${short(v.approved_wasm_hash)} ${copyBtn(v.approved_wasm_hash)}</div>
       </div>
       <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
         <span id="b-code">${chip("wait", "code unchecked")}</span>
@@ -189,10 +203,12 @@ async function renderVault(id) {
         <button class="primary" id="run-checks">Run all checks</button>
       </div>
     </div>
+    <p class="certline">This page certifies that every decision below was committed on NEAR before it executed anywhere, attested by Intel TDX to the approved code, and bounded by the stated guardrails — or shows you exactly where that failed.</p>
+    <div class="stamp-row" id="stamps" aria-live="polite"></div>
     ${v.integrity_alert ? `<div class="alert"><b>Integrity alert — deposits paused.</b> A decision arrived attested to different code: <code>${esc(v.integrity_alert)}</code></div>` : ""}
     <div class="cols">
-      <div class="panel"><h3>NAV${v.return_pct == null ? "" : ` (${fmtPct(v.return_pct)} since inception)`}</h3>${navChart(v)}</div>
-      <div class="panel"><h3>Guardrails — enforced by the contract, not the strategy</h3>
+      <div class="panel"><h3>Net asset value${v.return_pct == null ? "" : ` · ${fmtPct(v.return_pct)}`}</h3>${navChart(v)}</div>
+      <div class="panel"><h3>Terms of issue</h3>
         <dl class="kv">
           <dt>max leverage</dt><dd>${(g.max_leverage_bps / 10000).toFixed(1)}x</dd>
           <dt>max drawdown</dt><dd>${(g.max_drawdown_bps / 100).toFixed(0)}%</dd>
@@ -205,14 +221,14 @@ async function renderVault(id) {
         <p class="muted" style="font-size:12.5px; margin:10px 0 0">The sealed strategy decides <em>what</em> to trade; it cannot decide to exceed these. A breach is refused before any signature exists.</p>
       </div>
     </div>
-    <h2>Decision ledger <span class="muted" style="font-weight:400">— committed on NEAR before execution; open a row</span></h2>
+    <h2>Decision ledger <span class="annot">— each entry committed on NEAR before execution; open a row to inspect</span></h2>
     <div class="panel" style="padding:4px 10px">
       ${v.commitments.length ? `<table class="commits">
         <thead><tr><th></th><th>commitment</th><th>decision</th><th>status</th><th>committed</th></tr></thead>
         <tbody>${commitRows}</tbody>
       </table>` : `<p class="muted" style="padding:10px">No decisions yet. The first enclave run will commit here before it executes anywhere.</p>`}
     </div>
-    <h2>Checks <span class="muted" style="font-weight:400">— run in this browser</span></h2>
+    <h2>Examiner's checks <span class="annot">— performed by your browser, never by our server</span></h2>
     <div class="panel" id="check-log" aria-live="polite">
       <div class="check-row"><span class="what">Attested code: TDX attestations fetched from OutLayer; executed wasm equals the approved strategy</span><span class="result muted" id="r-code">not run</span></div>
       <div class="check-row"><span class="what">Every revealed trade recomputes to its pre-execution commitment (SHA-256, WebCrypto)</span><span class="result muted" id="r-trades">not run</span></div>
@@ -229,14 +245,19 @@ async function onRunChecks() {
     if (el) el.innerHTML = `<span class="${{ ok: "v-ok", bad: "v-bad", wait: "v-wait" }[r.state]}">${{ ok: "✓", bad: "✗", wait: "–" }[r.state]} ${esc(r.detail)}</span>`;
   };
   ["#b-code", "#b-trades", "#b-risk"].forEach((s) => { const el = $(s); if (el) el.innerHTML = `<span class="chip running"><span class="dot"></span>checking…</span>`; });
+  const stamps = $("#stamps");
+  if (stamps) stamps.innerHTML = "";
+  const addStamp = (r, words) => {
+    if (stamps) stamps.insertAdjacentHTML("beforeend", stamp(r.state, words[r.state]));
+  };
   const label = (names) => (r) => names[r.state];
   const codeL = label({ ok: "code attested", bad: "code mismatch", wait: "code unchecked" });
   const tradesL = label({ ok: "trades committed", bad: "back-fill detected", wait: "trades unchecked" });
   const riskL = label({ ok: "risk proven", bad: "risk breach", wait: "risk unproven" });
   await runAllChecks(v, {
-    onCode: (r) => { setChip("#b-code", r.state, codeL(r)); setRes("#r-code", r); },
-    onTrades: (r) => { setChip("#b-trades", r.state, tradesL(r)); setRes("#r-trades", r); },
-    onRisk: (r) => { setChip("#b-risk", r.state, riskL(r)); setRes("#r-risk", r); },
+    onCode: (r) => { setChip("#b-code", r.state, codeL(r)); setRes("#r-code", r); addStamp(r, { ok: "ATTESTED", bad: "VOID", wait: "UNVERIFIED" }); },
+    onTrades: (r) => { setChip("#b-trades", r.state, tradesL(r)); setRes("#r-trades", r); addStamp(r, { ok: "COMMITTED", bad: "VOID", wait: "UNVERIFIED" }); },
+    onRisk: (r) => { setChip("#b-risk", r.state, riskL(r)); setRes("#r-risk", r); addStamp(r, { ok: "IN LIMITS", bad: "VOID", wait: "UNPROVEN" }); },
     onTradeStep: (id) => { const el = $("#r-trades"); if (el) el.textContent = `recomputing #${id}…`; },
     onRiskStep: (ep) => { const el = $("#r-risk"); if (el) el.textContent = `verifying epoch ${ep}…`; },
     onCodeStep: (id) => { const el = $("#r-code"); if (el) el.textContent = `fetching TDX attestation for #${id}…`; },
@@ -245,7 +266,7 @@ async function onRunChecks() {
 
 // ------------------------------------------------------------ red-team console
 async function renderRedTeam() {
-  document.title = "Red-team console — Verifiable Alpha Vaults";
+  document.title = "Counterfeit Bureau — Verifiable Alpha Vaults";
   const data = await loadData();
   if (!data.cheats) {
     $("#view").innerHTML = `<p class="muted">Red-team fixtures unavailable (serve the frontend folder over http).</p>`;
@@ -256,8 +277,8 @@ async function renderRedTeam() {
   const degenRej = degen?.commitments.find((c) => c.status === "Rejected");
 
   $("#view").innerHTML = `
-    <h2 id="page-h" tabindex="-1">Red-team console</h2>
-    <p class="muted" style="max-width:70ch">Three ways a vault manager might cheat, and where each one dies. Everything below runs against real data structures — press the buttons.</p>
+    <h2 id="page-h" tabindex="-1">Counterfeit Bureau</h2>
+    <p class="muted" style="max-width:70ch; font-style:italic">Three ways a manager might forge a track record, and where each forgery dies. Everything below runs against real data — press the buttons and watch.</p>
     <div class="redteam">
       <div class="redteam-item">
         <h4>1 · Back-fill a winning trade</h4>

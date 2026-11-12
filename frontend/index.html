@@ -5,26 +5,52 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Verifiable Alpha Vaults</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,700;1,9..144,400;1,9..144,500&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <link rel="stylesheet" href="style.css">
+<script>
+// Guilloché corner rosette: interleaved epitrochoids, like the engine-turned
+// engraving on certificates and banknotes. Parametric, so it is ours alone.
+(() => {
+  const curves = [];
+  const [R, r0, d0] = [30, 7, 11];
+  for (let k = 0; k < 3; k++) {
+    const r = r0 + k * 2.1, d = d0 - k * 2.4;
+    let p = "";
+    for (let t = 0; t <= 720; t += 2) {
+      const a = (t * Math.PI) / 180;
+      const x = (R - r) * Math.cos(a) + d * Math.cos(((R - r) / r) * a);
+      const y = (R - r) * Math.sin(a) - d * Math.sin(((R - r) / r) * a);
+      p += (t ? "L" : "M") + (50 + x).toFixed(1) + " " + (50 + y).toFixed(1);
+    }
+    curves.push(`<path d="${p}" fill="none" stroke="%2320332c" stroke-width="0.55" opacity="0.5"/>`);
+  }
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">${curves.join("")}</svg>`;
+  document.documentElement.style.setProperty("--rosette", `url('data:image/svg+xml;utf8,${svg}')`);
+})();
+</script>
 </head>
 <body>
 <div class="wrap">
-  <header class="masthead">
-    <h1><a href="#/">Verifiable Alpha Vaults</a></h1>
-    <nav style="display:flex; gap:16px; align-items:baseline">
-      <a href="#/redteam" style="font-size:13.5px">Red-team console</a>
-      <span class="mode" id="mode">demo data · NEAR testnet</span>
-      <script>if (new URLSearchParams(location.search).has("vault")) document.currentScript.previousElementSibling.textContent = "live · NEAR testnet";</script>
+  <div class="sheet">
+    <header class="masthead">
+      <div class="over">NEAR TESTNET · REGISTRY OF ATTESTED TRADING VAULTS</div>
+      <h1><a href="#/">Verifiable Alpha Vaults</a></h1>
+      <p class="sub">This registry certifies what each vault did — not what its manager says.</p>
+    </header>
+    <div class="rule-band"><span class="mode" id="mode">demo + live records</span></div>
+    <p class="tagline">Strategy parameters stay sealed in secure hardware.
+      <b>Don't trust the returns — examine them:</b> which code ran, that every trade was committed before execution, that risk limits held. Every check runs in your browser.</p>
+    <nav class="toolbar">
+      <a href="#/">Registry</a>
+      <a href="#/redteam">Counterfeit Bureau</a>
     </nav>
-  </header>
-  <p class="tagline">Trading vaults whose strategy parameters stay sealed in secure hardware.
-    <b>Don't trust the returns — check them:</b> which code ran, that every trade was committed before execution, and that risk limits held. The checks run in your browser.</p>
-  <main id="view"><p class="muted">Loading…</p></main>
-  <footer>
-    Strategy parameters and future decisions are the protected asset; past trades are public by design — that's what makes returns auditable.
-    Attestations: Intel TDX via OutLayer (<code>worker.outlayer.testnet</code>). Risk proofs: Bulletproofs over Pedersen commitments, verified client-side.
-  </footer>
+    <main id="view"><p class="muted">Loading the registry…</p></main>
+    <footer>
+      Strategy parameters and future decisions are the protected asset; past trades are public by design — that is what makes returns auditable.
+      Attestations: Intel TDX via OutLayer (<code>worker.outlayer.testnet</code>). Risk proofs: Bulletproofs over Pedersen commitments, verified client-side.
+    </footer>
+    <div class="corner-b"></div>
+  </div>
 </div>
 <script type="module" src="app.js"></script>
 </body>
