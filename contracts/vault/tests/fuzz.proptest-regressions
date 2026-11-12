@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8f2dd9d0268c1a41f60bf37db00cee5da7a939b75fdc576d6992fad28f239906 # shrinks to ops = [Deposit { who: 0, milli: 1 }]
+cc eba91da25323df3f2f9664f8f2f1e8ea47190e69e676c8d6eafff08e98575c32 # shrinks to ops = [Deposit { who: 0, milli: 1 }, Pnl { bps: 1 }, Deposit { who: 4, milli: 1 }]
