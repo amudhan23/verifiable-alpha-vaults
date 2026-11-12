@@ -27,7 +27,7 @@ jobs:
       - name: Add wasm targets
         run: rustup target add wasm32-unknown-unknown wasm32-wasip1
       - name: Vault contract (NEAR deployable)
-        run: cargo build -p vault-contract --target wasm32-unknown-unknown --release
+        run: RUSTFLAGS="--cfg near" cargo build -p vault-contract --target wasm32-unknown-unknown --release
       - name: Strategy (OutLayer enclave binary) + approved hash
         run: |
           cargo build -p vault-strategy --target wasm32-wasip1 --release

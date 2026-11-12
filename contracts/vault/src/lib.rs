@@ -320,8 +320,9 @@ impl Vault {
         let id = self.commitments.len() as u64;
 
         if wasm_hash != self.approved_wasm_hash {
-            // Cheat 3: someone swapped the strategy code. Refuse, pause
-            // deposits, raise the alert — the leaderboard badge goes red.
+            // Cheat 3: someone swapped the strategy code. Record the refusal
+            // (a panic would ROLL BACK the alert on-chain), pause deposits,
+            // raise the alert — the leaderboard badge goes red.
             self.integrity_alert = Some(format!(
                 "attested wasm {} != approved {}",
                 wasm_hash, self.approved_wasm_hash
@@ -331,7 +332,20 @@ impl Vault {
                 "integrity_alert",
                 serde_json::json!({"id": id, "attested": wasm_hash, "approved": self.approved_wasm_hash}),
             );
-            env::panic_str("attested code hash does not match approved strategy; deposits paused");
+            self.commitments.push(TradeCommitment {
+                id,
+                commitment,
+                wasm_hash,
+                attestation_ref,
+                committed_at_height: env::block_height(),
+                committed_at_ms: env::block_timestamp_ms(),
+                status: CommitmentStatus::Rejected,
+                revealed: None,
+                salt_hex: None,
+                reject_reason: Some("attested code hash does not match approved strategy; deposits paused".into()),
+                execution_ref: None,
+            });
+            return id;
         }
 
         self.commitments.push(TradeCommitment {
@@ -856,10 +870,10 @@ mod tests {
         ctx(executor(), 0);
         let evil_hash = "d".repeat(64);
         let d = decision_json("buy", 10_000, 100, "ETH/USDC");
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            v.commit_decision(commit_of(&d, b"s"), evil_hash, "exec-3".into())
-        }));
-        assert!(res.is_err(), "commit with wrong code hash must abort");
+        // recorded as Rejected, NOT a panic: a panic would revert the alert on-chain
+        let id = v.commit_decision(commit_of(&d, b"s"), evil_hash, "exec-3".into());
+        let c = v.get_commitment(id).unwrap();
+        assert_eq!(c.status, CommitmentStatus::Rejected);
         assert!(v.deposits_paused);
         assert!(v.integrity_alert.is_some());
         // and new deposits are now refused

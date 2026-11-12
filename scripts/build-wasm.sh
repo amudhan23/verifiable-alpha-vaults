@@ -10,7 +10,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "== 1/3 vault contract =="
-cargo build -p vault-contract --target wasm32-unknown-unknown --release
+RUSTFLAGS="--cfg near" cargo build -p vault-contract --target wasm32-unknown-unknown --release
 CONTRACT=target/wasm32-unknown-unknown/release/vault_contract.wasm
 ls -la "$CONTRACT"
 

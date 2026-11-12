@@ -142,13 +142,18 @@ fn full_pipeline_backfilled_winner_is_caught() {
 }
 
 #[test]
-#[should_panic(expected = "does not match approved strategy")]
 fn full_pipeline_swapped_code_is_detected() {
     let mut v = vault();
     let params = Params { fast: 3, slow: 8, threshold_bps: 50, size_bps: 4_000, leverage_bps: 25_000 };
     let out = run(&params, &market_input(), [42u8; 32]);
     ctx("executor.testnet", 0);
-    // attestation says different code ran
+    // attestation says different code ran: recorded as Rejected (not a panic,
+    // which would revert the alert on-chain) and deposits pause
     let other_hash = "ab".repeat(32);
-    v.commit_decision(out.commitment, other_hash, "outlayer-exec-4".into());
+    let id = v.commit_decision(out.commitment, other_hash, "outlayer-exec-4".into());
+    assert_eq!(v.get_commitment(id).unwrap().status, CommitmentStatus::Rejected);
+    assert!(v.deposits_paused);
+    ctx("alice.testnet", 1_000);
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| v.deposit()));
+    assert!(res.is_err(), "deposits must be paused");
 }

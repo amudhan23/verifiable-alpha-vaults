@@ -11,7 +11,9 @@ const esc = (s) =>
   String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 const qs = new URLSearchParams(location.search);
-const LIVE_CONTRACT = qs.get("vault");
+// Live testnet vaults shown by default, alongside the demo vaults.
+const DEFAULT_LIVE_VAULTS = ["vault.alpha-vaults-23.testnet"];
+const LIVE_CONTRACTS = qs.get("vault") ? [qs.get("vault")] : DEFAULT_LIVE_VAULTS;
 const RPC_URL = qs.get("rpc") ?? undefined;
 
 let DATA = null;
@@ -27,12 +29,13 @@ async function loadData() {
     /* file:// or missing — handled below */
   }
   const data = { vaults: [...fixtures.vaults], cheats: fixtures.cheats, liveError: null };
-  if (LIVE_CONTRACT) {
+  for (const id of LIVE_CONTRACTS) {
     try {
-      const live = await new LiveVault(LIVE_CONTRACT, RPC_URL).load();
-      data.vaults.unshift(live);
+      data.vaults.unshift(await new LiveVault(id, RPC_URL).load());
+      const mode = document.getElementById("mode");
+      if (mode) mode.textContent = "live + demo · NEAR testnet";
     } catch (e) {
-      data.liveError = `couldn't reach ${LIVE_CONTRACT}: ${e.message}`;
+      data.liveError = `couldn't reach ${id}: ${e.message}`;
     }
   }
   DATA = data;
@@ -164,7 +167,7 @@ async function renderVault(id) {
           ${c.revealed ? `<div style="margin-top:6px"><span class="lbl">revealed decision</span>&nbsp; ${esc(c.revealed)} ${copyBtn(c.revealed)}</div>
           <div><span class="lbl">salt</span>&nbsp; ${c.salt_hex} ${copyBtn(c.salt_hex)}</div>` : ""}
           ${c.reject_reason ? `<div class="v-bad" style="margin-top:6px">refused by guardrails: ${esc(c.reject_reason)}</div>` : ""}
-          ${c.attestation_ref ? `<div style="margin-top:6px"><span class="lbl">attestation</span>&nbsp; ${esc(c.attestation_ref)} <span class="lbl">· wasm</span> ${short(c.wasm_hash)}</div>` : ""}
+          ${c.attestation_ref ? `<div style="margin-top:6px"><span class="lbl">attestation</span>&nbsp; ${c.attestation_ref.startsWith("https://") ? `<a href="${esc(c.attestation_ref)}" target="_blank" rel="noopener">${esc(c.attestation_ref)}</a>` : esc(c.attestation_ref)} <span class="lbl">· wasm</span> ${short(c.wasm_hash)}</div>` : ""}
           ${c.execution_ref ? `<div><span class="lbl">target-chain tx</span>&nbsp; ${esc(c.execution_ref)}</div>` : ""}
         </div>
         ${c.revealed ? `<button data-recompute="${c.id}">Recompute this hash</button><span class="check-line" id="recompute-${c.id}" role="status"></span>` : ""}
@@ -211,7 +214,7 @@ async function renderVault(id) {
     </div>
     <h2>Checks <span class="muted" style="font-weight:400">— run in this browser</span></h2>
     <div class="panel" id="check-log" aria-live="polite">
-      <div class="check-row"><span class="what">Attested code hash equals the approved strategy on every decision</span><span class="result muted" id="r-code">not run</span></div>
+      <div class="check-row"><span class="what">Attested code: TDX attestations fetched from OutLayer; executed wasm equals the approved strategy</span><span class="result muted" id="r-code">not run</span></div>
       <div class="check-row"><span class="what">Every revealed trade recomputes to its pre-execution commitment (SHA-256, WebCrypto)</span><span class="result muted" id="r-trades">not run</span></div>
       <div class="check-row"><span class="what">Bulletproof range proofs: private risk metrics stayed within the guardrails</span><span class="result muted" id="r-risk">not run</span></div>
     </div>`;
@@ -236,6 +239,7 @@ async function onRunChecks() {
     onRisk: (r) => { setChip("#b-risk", r.state, riskL(r)); setRes("#r-risk", r); },
     onTradeStep: (id) => { const el = $("#r-trades"); if (el) el.textContent = `recomputing #${id}…`; },
     onRiskStep: (ep) => { const el = $("#r-risk"); if (el) el.textContent = `verifying epoch ${ep}…`; },
+    onCodeStep: (id) => { const el = $("#r-code"); if (el) el.textContent = `fetching TDX attestation for #${id}…`; },
   });
 }
 

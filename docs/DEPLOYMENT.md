@@ -27,3 +27,25 @@ cd executor && node run.mjs --enclave outlayer --vault near
 - First live trade: commitment #5 on NEAR → MPC signature from `v1.signer-prod.testnet` → [Sepolia tx `0x25d727…bd4a`](https://sepolia.etherscan.io/tx/0x25d727ebe6836e9ab6b887af8b6727ebb30aca6586484d29ef84c8aedb59bd4a) carrying the commitment hash in calldata → execution ref recorded back on the vault.
 - The chain of custody is fully public: NEAR commitment (pre-execution) ↔ Sepolia calldata ↔ reveal + attestation.
 - Note: commitments #3/#4 remain `Committed` (sealed) — artifacts of executor-crash runs; their decisions were never revealed, which the ledger displays honestly.
+
+## Red-team, live on-chain (Thu 12 Nov, ~04:20 ET)
+
+All three cheats were attempted for real against `vault.alpha-vaults-23.testnet`:
+
+| Cheat | On-chain result |
+|---|---|
+| 10x leverage under the 3x cap | commitment #6: `Rejected — leverage 100000bps exceeds max 30000bps` (permanent ledger entry) |
+| Back-fill a winning trade | tx [`9RZeAaK6hzuATMga9qrWQFsukkCqZ9DWeXKWcRKyuNS3`](https://testnet.nearblocks.io/txns/9RZeAaK6hzuATMga9qrWQFsukkCqZ9DWeXKWcRKyuNS3): `Smart contract panicked: reveal does not match commitment: this trade was not committed when claimed` — the honest reveal of the same commitment then succeeded |
+| Swapped strategy code | recorded as `Rejected` + integrity alert + deposits paused (unit + pipeline tested; not run against the live vault to keep it depositable) |
+
+## Build note: `--cfg near` (important)
+
+near-sdk 5.30 compiles its host functions only under `--cfg near`
+(what `cargo near build` sets). A plain cargo wasm build silently gets
+pure-Rust fallbacks: sha256 still computes correctly, but every panic
+becomes a raw `unreachable` trap and messages are lost. We build with
+`RUSTFLAGS="--cfg near"` (see scripts/build-wasm.sh); found the hard way,
+fixed, and verified: on-chain errors now read `Smart contract panicked: …`.
+
+Known ledger artifacts kept honestly: #3/#4 forever `Committed` (sealed) from
+executor-crash runs; #6 the rejected 10x breach; #7–#8 red-team targets.

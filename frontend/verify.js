@@ -46,16 +46,46 @@ export async function checkTradesCommitted(vault, onStep = () => {}) {
   return { state: "ok", detail: `${okCount}/${revealed.length} commitments recomputed in this browser` };
 }
 
-/** Badge 1: code hashes match the approved strategy. */
+/** Badge 1 (quick, sync): on-chain hash comparison for leaderboard chips. */
 export function checkCodeAttested(vault) {
   if (vault.integrity_alert) return { state: "bad", detail: vault.integrity_alert };
-  const mismatched = vault.commitments.filter((c) => c.wasm_hash !== vault.approved_wasm_hash);
+  const honored = vault.commitments.filter((c) => c.reject_reason == null || !c.reject_reason.includes("code hash"));
+  const mismatched = honored.filter((c) => c.wasm_hash !== vault.approved_wasm_hash);
   if (mismatched.length > 0)
     return { state: "bad", detail: `${mismatched.length} decisions attested to different code` };
   if (vault.commitments.length === 0) return { state: "wait", detail: "no attested decisions yet" };
   return {
     state: "ok",
     detail: `${vault.commitments.length} decisions attested to ${vault.approved_wasm_hash.slice(0, 12)}…`,
+  };
+}
+
+/** Badge 1 (deep): additionally FETCH the TDX attestations from OutLayer's
+ * public API and compare the executed wasm sha256 against the approved hash.
+ * Real third-party verification — the API is public and CORS-open. */
+export async function checkCodeAttestedDeep(vault, onStep = () => {}) {
+  const quick = checkCodeAttested(vault);
+  if (quick.state !== "ok") return quick;
+  const fetchable = vault.commitments.filter((c) => c.attestation_ref?.startsWith("https://")).slice(-6);
+  if (fetchable.length === 0)
+    return { ...quick, detail: quick.detail + " (no fetchable attestations — demo data)" };
+  let verified = 0;
+  for (const c of fetchable) {
+    onStep(c.id);
+    try {
+      const att = await (await fetch(c.attestation_ref)).json();
+      const executed = att.executed_wasm_sha256 ?? att.wasm_hash;
+      if (executed !== vault.approved_wasm_hash)
+        return { state: "bad", detail: `attestation for #${c.id}: executed wasm ${String(executed).slice(0, 12)}… ≠ approved` };
+      if (!att.tdx_quote) return { state: "bad", detail: `attestation for #${c.id} has no TDX quote` };
+      verified++;
+    } catch {
+      return { state: "wait", detail: `attestation for #${c.id} not reachable right now` };
+    }
+  }
+  return {
+    state: "ok",
+    detail: `${verified} TDX attestations fetched from OutLayer; executed wasm = approved on all`,
   };
 }
 
@@ -113,7 +143,7 @@ export async function checkRiskProven(vault, onStep = () => {}) {
 }
 
 export async function runAllChecks(vault, hooks = {}) {
-  const code = checkCodeAttested(vault);
+  const code = await checkCodeAttestedDeep(vault, hooks.onCodeStep);
   hooks.onCode?.(code);
   const trades = await checkTradesCommitted(vault, hooks.onTradeStep);
   hooks.onTrades?.(trades);

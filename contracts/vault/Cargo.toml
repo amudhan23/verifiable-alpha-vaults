@@ -16,7 +16,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
 
-[dev-dependencies]
+# unit-testing mocks the NEAR host functions; gating it to non-wasm keeps the
+# mocks out of the deployable contract (otherwise panics become raw traps and
+# sha256 runs in-wasm). Tests only ever run on the host.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 near-sdk = { version = "5", features = ["unit-testing"] }
+
+[dev-dependencies]
 vault-strategy = { path = "../../strategy" }
 vault-proofs = { path = "../../crates/proofs" }
