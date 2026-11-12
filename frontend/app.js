@@ -196,7 +196,8 @@ async function renderVault(id) {
           <dt>max position</dt><dd>${(g.max_position_bps / 100).toFixed(0)}% of NAV</dd>
           <dt>pairs</dt><dd>${g.allowed_pairs.map(esc).join(", ")}</dd>
           <dt>pool</dt><dd>${v.pool_near} NEAR</dd>
-          <dt>manager</dt><dd>${esc(v.manager)}</dd>
+          <dt>perf fee</dt><dd>20% above high-water mark</dd>
+          <dt>manager</dt><dd title="holder of the strategy NFT">${esc(v.manager)}</dd>
         </dl>
         <p class="muted" style="font-size:12.5px; margin:10px 0 0">The sealed strategy decides <em>what</em> to trade; it cannot decide to exceed these. A breach is refused before any signature exists.</p>
       </div>
