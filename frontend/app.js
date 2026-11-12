@@ -363,4 +363,6 @@ async function route() {
   $("#page-h")?.focus({ preventScroll: true });
 }
 window.addEventListener("hashchange", route);
-route();
+route().then(() => {
+  if (qs.has("autocheck") && location.hash.startsWith("#/vault/")) setTimeout(onRunChecks, 300);
+});

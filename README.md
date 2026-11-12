@@ -26,6 +26,8 @@ things independently verifiable:
 > additionally keeps epoch risk *metrics* (peak leverage, drawdown path)
 > private while proving they stayed within the public limits.
 
+![Vault page: all three verifications green after running the checks in-browser](docs/img/vault.png)
+
 ![Leaderboard: three vaults with verification chips](docs/img/leaderboard.png)
 
 ## Architecture
@@ -72,7 +74,9 @@ cd frontend && python3 -m http.server 8080
 ```
 
 (The demo fixtures' commitments and Bulletproofs are REAL — regenerate with
-`cargo run -p gen-fixtures`. WASM artifacts: `scripts/build-wasm.sh`.)
+`cargo run -p gen-fixtures`. The browser verifier wasm in `frontend/pkg/` is
+built and committed by CI; rebuild anything with `scripts/build-wasm.sh`.
+Add `?autocheck` to the URL to run the checks on page load.)
 
 The Rust suite runs the full pipeline end-to-end
 (`contracts/vault/tests/pipeline.rs`) and the three **"try to cheat"**
