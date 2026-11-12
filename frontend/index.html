@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verifiable Alpha Vaults</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="masthead">
+    <h1><a href="#/">Verifiable Alpha Vaults</a></h1>
+    <nav style="display:flex; gap:16px; align-items:baseline">
+      <a href="#/redteam" style="font-size:13.5px">Red-team console</a>
+      <span class="mode">demo data · NEAR testnet</span>
+    </nav>
+  </header>
+  <p class="tagline">Trading vaults whose strategy parameters stay sealed in secure hardware.
+    <b>Don't trust the returns — check them:</b> which code ran, that every trade was committed before execution, and that risk limits held. The checks run in your browser.</p>
+  <main id="view"><p class="muted">Loading…</p></main>
+  <footer>
+    Strategy parameters and future decisions are the protected asset; past trades are public by design — that's what makes returns auditable.
+    Attestations: Intel TDX via OutLayer (<code>worker.outlayer.testnet</code>). Risk proofs: Bulletproofs over Pedersen commitments, verified client-side.
+  </footer>
+</div>
+<script type="module" src="app.js"></script>
+</body>
+</html>

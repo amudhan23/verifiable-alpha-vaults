@@ -1,0 +1,163 @@
+/* Verifiable Alpha Vaults — verification instrument.
+   Color only ever means verification state. */
+
+:root {
+  --ink: #101823;
+  --panel: #182330;
+  --panel-2: #1f2c3c;
+  --line: #273548;
+  --text: #e8edf2;
+  --muted: #71809b;
+  --proven: #2fbf8f;
+  --proven-dim: #194639;
+  --failed: #e0524f;
+  --failed-dim: #4a2423;
+  --pending: #d9a441;
+  --pending-dim: #4a3b1c;
+  --sans: "IBM Plex Sans", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+* { box-sizing: border-box; }
+html { color-scheme: dark; }
+body {
+  margin: 0;
+  background: var(--ink);
+  color: var(--text);
+  font: 15px/1.55 var(--sans);
+}
+a { color: inherit; }
+button {
+  font: 500 13.5px var(--sans);
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 14px;
+  cursor: pointer;
+}
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--text); color: var(--ink); border-color: var(--text); }
+:focus-visible { outline: 2px solid var(--proven); outline-offset: 2px; }
+
+.wrap { max-width: 1100px; margin: 0 auto; padding: 36px 20px 80px; }
+
+/* header */
+.masthead { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-bottom: 8px; }
+.masthead h1 { font-size: 21px; font-weight: 600; letter-spacing: -0.01em; margin: 0; }
+.masthead h1 a { text-decoration: none; }
+.masthead .mode { font: 12.5px var(--mono); color: var(--muted); }
+.tagline { color: var(--muted); max-width: 62ch; margin: 0 0 32px; }
+.tagline b { color: var(--text); font-weight: 500; }
+
+h2 { font-size: 16px; font-weight: 600; margin: 36px 0 12px; }
+.mono, code { font-family: var(--mono); font-size: 0.92em; }
+.muted { color: var(--muted); }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+/* verification states */
+.v-ok { color: var(--proven); }
+.v-bad { color: var(--failed); }
+.v-wait { color: var(--pending); }
+
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  font: 500 12.5px var(--sans);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px 10px 3px 7px;
+  background: var(--panel);
+  white-space: nowrap;
+}
+.chip .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.chip.ok   { border-color: var(--proven-dim); } .chip.ok .dot { background: var(--proven); }
+.chip.bad  { border-color: var(--failed-dim); } .chip.bad .dot { background: var(--failed); }
+.chip.wait { border-color: var(--pending-dim); } .chip.wait .dot { background: var(--pending); }
+.chip.running .dot { animation: pulse 0.8s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.25; } }
+@media (prefers-reduced-motion: reduce) { .chip.running .dot { animation: none; } }
+
+/* leaderboard ledger */
+.ledger { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.ledger-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) 110px 120px minmax(0, 2fr);
+  gap: 18px; align-items: center;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line);
+  text-decoration: none;
+  background: var(--panel);
+}
+.ledger-row:last-child { border-bottom: 0; }
+.ledger-row:hover { background: var(--panel-2); }
+.ledger-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) 110px 120px minmax(0, 2fr);
+  gap: 18px; padding: 9px 18px;
+  font-size: 12.5px; color: var(--muted);
+  border-bottom: 1px solid var(--line);
+}
+.vault-name { font-weight: 600; }
+.vault-name small { display: block; font-weight: 400; color: var(--muted); font-family: var(--mono); font-size: 11.5px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; }
+.ret { font-family: var(--mono); font-size: 15px; text-align: right; }
+.badges { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.spark { display: block; }
+
+/* vault page */
+.vault-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; margin: 4px 0 20px; }
+.vault-head h2 { margin: 0; font-size: 22px; }
+.vault-head .sub { font-family: var(--mono); font-size: 12.5px; color: var(--muted); margin-top: 4px; }
+
+.alert {
+  border: 1px solid var(--failed-dim);
+  background: color-mix(in srgb, var(--failed-dim) 45%, var(--ink));
+  color: var(--text);
+  border-left: 3px solid var(--failed);
+  border-radius: 8px; padding: 12px 16px; margin: 0 0 20px;
+}
+.alert code { color: var(--failed); word-break: break-all; }
+
+.cols { display: grid; grid-template-columns: 1.5fr 1fr; gap: 16px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; min-width: 0; }
+.panel h3 { margin: 0 0 10px; font-size: 13.5px; font-weight: 600; color: var(--muted); }
+
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 18px; font-size: 13.5px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; font-family: var(--mono); text-align: right; }
+
+/* commitments ledger */
+table.commits { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+table.commits th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12.5px; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+table.commits td { padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.commits tr.expandable { cursor: pointer; }
+table.commits tr.expandable:hover td { background: var(--panel-2); }
+.hash { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.reveal-box { background: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin: 4px 0 8px; font-family: var(--mono); font-size: 12px; overflow-x: auto; }
+.reveal-box .lbl { color: var(--muted); font-family: var(--sans); font-size: 12px; }
+.check-line { font-family: var(--mono); font-size: 12.5px; margin-top: 8px; }
+
+/* proofs + checks */
+.check-row { display: flex; align-items: baseline; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 13.5px; }
+.check-row:last-child { border-bottom: 0; }
+.check-row .what { flex: 1; }
+.check-row .result { font-family: var(--mono); font-size: 12.5px; }
+
+/* red team console */
+.redteam { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.redteam-item { padding: 16px 18px; border-bottom: 1px solid var(--line); }
+.redteam-item:last-child { border-bottom: 0; }
+.redteam-item h4 { margin: 0 0 4px; font-size: 14px; }
+.redteam-item p { margin: 0 0 10px; color: var(--muted); font-size: 13.5px; max-width: 70ch; }
+.console-out { font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap; word-break: break-all; background: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-top: 10px; }
+
+footer { margin-top: 48px; color: var(--muted); font-size: 12.5px; max-width: 72ch; }
+
+@media (max-width: 760px) {
+  .cols { grid-template-columns: 1fr; }
+  .ledger-head { display: none; }
+  .ledger-row { grid-template-columns: 1fr auto; grid-template-areas: "name ret" "spark spark" "badges badges"; }
+  .ledger-row .vault-name { grid-area: name; }
+  .ledger-row .ret { grid-area: ret; }
+  .ledger-row .spark-cell { grid-area: spark; }
+  .ledger-row .badges { grid-area: badges; justify-content: flex-start; }
+}

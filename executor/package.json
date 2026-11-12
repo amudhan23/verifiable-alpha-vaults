@@ -1,0 +1,16 @@
+{
+  "name": "vault-executor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Relays attested decisions: enclave (OutLayer TDX or local sim) -> vault contract (NEAR) -> execution",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "cycle:dry": "node run.mjs --enclave local --vault dry",
+    "cycle:testnet": "node run.mjs --enclave outlayer --vault near",
+    "test": "node test.mjs"
+  },
+  "dependencies": {
+    "near-api-js": "^5"
+  }
+}

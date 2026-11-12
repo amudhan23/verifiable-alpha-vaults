@@ -859,6 +859,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gen-fixtures"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde_json",
+ "sha2 0.10.9",
+ "vault-proofs",
+ "vault-strategy",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

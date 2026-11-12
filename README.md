@@ -57,10 +57,22 @@ investor ──deposit──► Vault contract (NEAR, near-sdk Rust)
 ## Run everything (no network needed)
 
 ```bash
-cargo test --workspace
+cargo test --workspace          # 31 Rust tests (proofs, contract, strategy, pipeline)
+node executor/test.mjs          # 4 executor tests incl. a full local-enclave cycle
+node executor/run.mjs           # one full cycle, offline: enclave -> commit -> reveal -> proof
 ```
 
-This runs 31 tests including the full pipeline end-to-end
+To see the product, serve the frontend and open http://localhost:8080 —
+leaderboard, vault pages with in-browser verification, and the red-team console:
+
+```bash
+cd frontend && python3 -m http.server 8080
+```
+
+(The demo fixtures' commitments and Bulletproofs are REAL — regenerate with
+`cargo run -p gen-fixtures`. WASM artifacts: `scripts/build-wasm.sh`.)
+
+The Rust suite runs the full pipeline end-to-end
 (`contracts/vault/tests/pipeline.rs`) and the three **"try to cheat"**
 scenarios:
 

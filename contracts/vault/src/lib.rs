@@ -92,6 +92,9 @@ pub struct TradeCommitment {
     pub status: CommitmentStatus,
     /// Revealed decision JSON (only after execution/rejection).
     pub revealed: Option<String>,
+    /// Salt (hex) published at reveal so anyone can recompute
+    /// sha256(revealed || salt) == commitment.
+    pub salt_hex: Option<String>,
     /// Why a reveal was rejected, if it was.
     pub reject_reason: Option<String>,
     /// Target-chain tx hash once executed (filled by executor).
@@ -266,6 +269,7 @@ impl Vault {
             committed_at_ms: env::block_timestamp_ms(),
             status: CommitmentStatus::Committed,
             revealed: None,
+            salt_hex: None,
             reject_reason: None,
             execution_ref: None,
         });
@@ -309,6 +313,7 @@ impl Vault {
             let entry = self.commitments.get_mut(id as u32).unwrap();
             entry.status = CommitmentStatus::Rejected;
             entry.revealed = Some(decision_json.clone());
+            entry.salt_hex = Some(salt_hex.clone());
             entry.reject_reason = Some(reason.clone());
             emit(
                 "guardrail_rejected",
@@ -320,6 +325,7 @@ impl Vault {
         let entry = self.commitments.get_mut(id as u32).unwrap();
         entry.status = CommitmentStatus::Executed;
         entry.revealed = Some(decision_json.clone());
+        entry.salt_hex = Some(salt_hex.clone());
         emit(
             "executed",
             serde_json::json!({"id": id, "decision": decision_json}),
