@@ -15,6 +15,15 @@ things independently verifiable:
 | 3 | **Risk limits held** | Guardrails (leverage ≤ 3x, position caps, asset allowlist) enforced in the contract before anything is signed, **plus** Bulletproofs range proofs that private risk metrics stayed in range — verified in your browser |
 | 4 | **Real returns** | Share accounting and NAV history are on-chain; returns computed from balances + oracle |
 
+### Security, reviewed adversarially
+
+An independent review of v3 found **3 Critical issues** (the executor could drain the pool through misreported valuations; the cross-chain wallet was the executor's, not the vault's; claims could overpay). **v4 fixes all of them, on the live vault**:
+- Withdrawals pay an exact slice of the pool and never read the valuation.
+- The vault builds and MPC-signs its own transactions; recipients are locked to itself.
+- Repatriated value is paid out solvent to the yocto.
+
+Every finding, fix and regression test, plus the residual risks, is in [`docs/SECURITY.md`](docs/SECURITY.md).
+
 ### Every claim, checked in your browser
 
 Four seals, four independent checks against public data. None trust our server:
