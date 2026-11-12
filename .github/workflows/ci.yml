@@ -19,6 +19,8 @@ jobs:
 
   wasm:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -48,3 +50,35 @@ jobs:
             target/wasm32-wasip1/release/strategy.wasm
             strategy.wasm.sha256
             frontend/pkg/
+      - name: Commit the browser verifier into the repo (clean clones verify with zero build)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898270+github-actions[bot]@users.noreply.github.com"
+          git add -f frontend/pkg strategy.wasm.sha256
+          git diff --cached --quiet || { git commit -m "ci: rebuild browser verifier wasm [skip ci]"; git push; }
+
+  pages:
+    # Hosted demo. Activates once the repo is public (GitHub Pages on free
+    # plans requires a public repo), so it comes alive at submission time.
+    needs: wasm
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      pages: write
+      id-token: write
+      contents: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main, fetch-depth: 0 }
+      - run: git pull --rebase origin main   # pick up the pkg commit from the wasm job
+      - uses: actions/configure-pages@v5
+        with: { enablement: true }
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: frontend }
+      - id: deployment
+        uses: actions/deploy-pages@v4

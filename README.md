@@ -26,6 +26,8 @@ things independently verifiable:
 > additionally keeps epoch risk *metrics* (peak leverage, drawdown path)
 > private while proving they stayed within the public limits.
 
+![Leaderboard: three vaults with verification chips](docs/img/leaderboard.png)
+
 ## Architecture
 
 ```
@@ -89,6 +91,12 @@ echo '{"epoch":1,"nonce":1,"pair":"ETH/USDC","prices":[100,100,100,100,100,102,1
 | STRATEGY_PARAMS='{"fast":3,"slow":8,"threshold_bps":50,"size_bps":4000,"leverage_bps":25000}' \
 cargo run -q -p vault-strategy
 ```
+
+### Red-team console
+
+The frontend ships a console that runs the three cheats live:
+
+![Red-team console](docs/img/redteam.png)
 
 ## Testnet deployment
 
