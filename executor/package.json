@@ -13,9 +13,10 @@
     "test": "node test.mjs"
   },
   "dependencies": {
-    "near-api-js": "^5",
-    "chainsig.js": "^1",
     "@near-js/crypto": "^2",
+    "chainsig.js": "^1",
+    "near-api-js": "^5",
+    "puppeteer-core": "^25.17.0",
     "viem": "^2"
   }
 }

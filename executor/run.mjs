@@ -61,7 +61,17 @@ function need(k) {
   return v;
 }
 
-// --- one cycle ----------------------------------------------------------------
+// --- cycle loop -----------------------------------------------------------------
+const everyMin = Number(arg("every", "0"));
+do {
+  await cycle();
+  if (everyMin > 0) {
+    console.log(`\n(sleeping ${everyMin} min — ctrl-c to stop)\n`);
+    await new Promise((r) => setTimeout(r, everyMin * 60_000));
+  }
+} while (everyMin > 0);
+
+async function cycle() {
 const epoch = Number(arg("epoch", `${Math.floor(Date.now() / 3_600_000)}`));
 const input = {
   epoch,
@@ -116,3 +126,4 @@ if (output.risk_bundle) {
 }
 
 console.log("\ncycle complete:", JSON.stringify(await vault.view(), null, 2));
+}

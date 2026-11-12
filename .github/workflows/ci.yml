@@ -32,6 +32,10 @@ jobs:
         run: |
           cargo build -p vault-strategy --target wasm32-wasip1 --release
           sha256sum target/wasm32-wasip1/release/strategy.wasm | tee strategy.wasm.sha256
+      - name: WASI smoke test (run strategy.wasm exactly as OutLayer does)
+        run: |
+          pip install wasmtime -q
+          python3 scripts/wasi-smoke.py
       - name: Browser proof verifier (Bulletproofs in the browser)
         run: |
           cargo build -p vault-proofs --target wasm32-unknown-unknown --release --features wasm
