@@ -17,7 +17,7 @@
 import crypto from "node:crypto";
 import { LocalEnclave, OutLayerEnclave } from "./enclave.mjs";
 import { NearVault, DryRunVault } from "./vault.mjs";
-import { ChainSigExecutor } from "./evm.mjs";
+import { VaultSignedExecutor } from "./evm.mjs";
 import { fetchMarket, fixedMarket } from "./oracle.mjs";
 
 const arg = (name, dflt) => {
@@ -48,11 +48,9 @@ const onChain = arg("vault", "dry") === "near";
 const vault = onChain
   ? new NearVault({ contractId: need("VAULT_CONTRACT_ID"), accountId: need("NEAR_ACCOUNT_ID"), privateKey: need("NEAR_PRIVATE_KEY") })
   : new DryRunVault({ approvedWasmHash: APPROVED_WASM_HASH });
-// read-only balance access on every live cycle (risk + settlement are
-// computed from real holdings); swaps only with --execute evm
-const chainsig = onChain
-  ? new ChainSigExecutor({ accountId: need("NEAR_ACCOUNT_ID"), privateKey: need("NEAR_PRIVATE_KEY") })
-  : null;
+// balances read on every live cycle (risk + settlement use real holdings);
+// swaps only with --execute evm — and the VAULT signs them (v4)
+const chainsig = onChain ? new VaultSignedExecutor({ vault, vaultId: need("VAULT_CONTRACT_ID") }) : null;
 const evm = arg("execute", "sim") === "evm" ? chainsig : null;
 
 /** Decrypt the enclave's sealed payload (ChaCha20-Poly1305, key = SEAL_KEY_HEX). */
@@ -104,29 +102,34 @@ async function cycle() {
   };
 
   console.log(`→ enclave run (epoch ${epoch})`);
-  const { output, attestationRef, callId, timeMs } = await enclave.run(input);
-  console.log(`  done in ${timeMs}ms · call ${callId}`);
+  const { output, attestationRef, callId, timeMs, executedWasm } = await enclave.run(input);
+  const wasmForVault = executedWasm ?? APPROVED_WASM_HASH; // local sim has no attestation
+  console.log(`  done in ${timeMs}ms · call ${callId}${executedWasm ? ` · TDX ran ${executedWasm.slice(0, 12)}…` : ""}`);
   const sealed = await unseal(output);
 
   console.log("→ commit on vault (before execution) + publish the exact enclave input");
-  const id = await vault.commitDecision(output.commitment, APPROVED_WASM_HASH, attestationRef, JSON.stringify(input));
+  const id = await vault.commitDecision(output.commitment, wasmForVault, attestationRef, JSON.stringify(input));
   console.log(`  committed as #${id} · input sha256 ${crypto.createHash("sha256").update(JSON.stringify(input)).digest("hex").slice(0, 16)}…`);
 
   const decision = JSON.parse(sealed.decision_json);
-  let execRef = null;
-  if (evm && decision.action !== "hold") {
-    console.log(`→ execute ${decision.action} as a real Uniswap v3 swap via Chain Signatures`);
-    const r = await evm.executeTrade({ commitment: output.commitment, decision, ethUsd: market.oracle.eth_usd });
+
+  // v4 order: REVEAL first (guardrails checked on-chain), then the VAULT
+  // signs the swap. Brief public window before the swap lands: bounded by
+  // the 2% slippage guard; on mainnet, submit via a private mempool.
+  console.log("→ reveal on vault (guardrails enforced by the contract)");
+  await vault.executeDecision(id, sealed.decision_json, sealed.salt_hex);
+  const status = onChain ? (await vault.view("get_commitment", { id })).status : "Executed";
+  if (status !== "Executed") {
+    console.log(`  decision ${status} by guardrails — nothing will be signed`);
+  } else if (evm && decision.action !== "hold") {
+    console.log(`→ execute ${decision.action}: the vault signs each leg via MPC; executor verifies + broadcasts`);
+    const r = await evm.executeTrade({ id, commitment: output.commitment, decision, ethUsd: market.oracle.eth_usd });
     for (const t of r.txs) console.log(`  ${t.step}: ${t.status} ${t.hash}`);
     console.log(`  ${r.detail}`);
-    execRef = r.ref;
+    if (r.ref) await vault.recordExecutionRef(id, r.ref);
   } else {
     console.log(`→ ${decision.action}${evm ? "" : " [simulated fill — pass --execute evm for a real swap]"}`);
   }
-
-  console.log("→ reveal on vault (guardrails enforced by the contract)");
-  await vault.executeDecision(id, sealed.decision_json, sealed.salt_hex);
-  if (execRef) await vault.recordExecutionRef(id, execRef);
 
   if (output.risk_bundle) {
     await vault.postRiskProof(epoch, JSON.stringify(output.risk_bundle));
@@ -135,9 +138,32 @@ async function cycle() {
     console.log(`→ NO risk proof possible: ${output.risk_error}`);
   }
 
-  // settle last: the state checked at commit must not move mid-cycle
-  if (output.settlement) {
-    console.log(`→ settle cross-chain value into NAV: ${(Number(output.settlement.external_value_yocto) / 1e24).toFixed(4)} NEAR @ evm block ${output.settlement.evm_block}`);
+  // settle last (state checked at commit must not move mid-cycle). v4 bounds:
+  // >= 1h apart, holders' NAV may move <= 10% per settlement; a larger true
+  // move converges over several bounded settlements.
+  if (output.settlement && onChain) {
+    const s = await vault.view("get_summary");
+    const since = Date.now() - Number(s.last_settlement_ms || 0);
+    if (Number(s.last_settlement_ms) > 0 && since < 3_600_000) {
+      console.log(`→ settlement skipped: last one ${Math.round(since / 60000)} min ago (1h minimum)`);
+    } else {
+      const target = BigInt(output.settlement.external_value_yocto);
+      const units = BigInt(s.ext_units_total), vunits = BigInt(s.vault_ext_units);
+      const pool = BigInt(s.pool_yocto), nav = BigInt(s.nav_yocto);
+      let wallet = target;
+      if (units > 0n && vunits > 0n) {
+        const step = (nav * 99n) / 1000n; // 9.9%
+        let holders = (target * vunits) / units;
+        const lo = nav - step - pool, hi = nav + step - pool;
+        if (holders > hi) holders = hi;
+        if (holders < (lo > 0n ? lo : 0n)) holders = lo > 0n ? lo : 0n;
+        wallet = (holders * units) / vunits;
+      }
+      const clamped = wallet !== target;
+      console.log(`→ settle cross-chain wallet: ${(Number(wallet) / 1e24).toFixed(4)} NEAR @ evm block ${output.settlement.evm_block}${clamped ? ` (bounded step toward ${(Number(target) / 1e24).toFixed(4)})` : ""}`);
+      await vault.settlePnl(wallet.toString(), output.settlement.evm_block, attestationRef);
+    }
+  } else if (output.settlement) {
     await vault.settlePnl(output.settlement.external_value_yocto, output.settlement.evm_block, attestationRef);
   }
   const after = onChain ? await vault.view("get_summary") : await vault.view();

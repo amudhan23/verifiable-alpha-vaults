@@ -70,7 +70,8 @@ export const yoctoToNear = (y, dp = 4) => (Number((BigInt(y) * 10n ** BigInt(dp)
 export const deposit = (near) => call("deposit", {}, nearToYocto(near));
 export const withdrawShares = (shares) => call("withdraw", { shares: String(shares) });
 export const triggerEmergency = () => call("trigger_emergency", {});
-export const claimRecovered = () => call("claim_recovered", {});
+export const claimExternal = () => call("claim_external", {});
+export const retryPayout = () => call("retry_payout", {});
 
 async function view(contractId, method, args) {
   const res = await fetch(RPC, {
@@ -90,13 +91,14 @@ export async function position(contractId, accountId) {
   const [shares, s, claim] = await Promise.all([
     view(contractId, "get_shares", { account: accountId }),
     view(contractId, "get_summary", {}),
-    view(contractId, "get_claim", { account: accountId }).catch(() => null),
+    view(contractId, "get_external_position", { account: accountId }).catch(() => null),
   ]);
   const total = BigInt(s.total_shares || "0");
   const nav = BigInt(s.nav_yocto ?? s.pool_yocto);
   const mine = BigInt(shares);
   const value = total > 0n ? (nav * mine) / total : 0n;
-  // what a normal withdrawal could pay right now (local liquidity)
-  const local = BigInt(s.pool_yocto);
-  return { shares: mine, value, local, summary: s, claim };
+  // v4: a withdrawal pays exactly your slice of the NEAR pool now; the rest
+  // of your value moves to you as external units (claimable as repatriated)
+  const localSlice = total > 0n ? (BigInt(s.pool_yocto) * mine) / total : 0n;
+  return { shares: mine, value, localSlice, summary: s, ext: claim };
 }

@@ -36,11 +36,22 @@ export class OutLayerEnclave {
     if (body.status !== "completed") {
       throw new Error(`OutLayer call ${body.call_id ?? "?"} ${body.status}: ${body.error ?? res.status}`);
     }
+    // The code hash the vault records comes from the ATTESTATION (what the
+    // TDX worker actually ran), never from executor config.
+    let executedWasm = null;
+    for (let i = 0; i < 6 && !executedWasm; i++) {
+      try {
+        const att = await this.attestation(body.call_id);
+        executedWasm = att.executed_wasm_sha256 ?? att.wasm_hash ?? null;
+      } catch { await new Promise((r) => setTimeout(r, 1500)); }
+    }
+    if (!executedWasm) throw new Error(`no attestation for call ${body.call_id}: refusing to commit without an attested code hash`);
     return {
       output: typeof body.output === "string" ? JSON.parse(body.output) : body.output,
       attestationRef: `${this.base}${body.attestation_url}`,
       callId: body.call_id,
       timeMs: body.time_ms,
+      executedWasm,
     };
   }
 

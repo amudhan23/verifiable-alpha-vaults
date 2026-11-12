@@ -222,3 +222,133 @@ export class ChainSigExecutor {
     };
   }
 }
+
+// ---------------------------------------------------------------------------
+// v4: the VAULT signs. The contract builds each tx (recipient locked to its
+// own address, fixed targets, gas caps) and calls the MPC signer itself; the
+// executor rebuilds the same tx locally, checks the hash matches what the
+// vault signed, attaches the signature, and broadcasts.
+// ---------------------------------------------------------------------------
+const GAS = { wrap: 120_000n, approve: 120_000n, swap: 350_000n };
+const MAX_FEE_CAP = 300_000_000_000n; // mirror the contract cap
+
+export class VaultSignedExecutor {
+  /** @param {{vault: import('./vault.mjs').NearVault, vaultId: string, mpcPath?: string}} cfg */
+  constructor({ vault, vaultId, mpcPath = "alpha-vault-v1", rpcUrl = "https://ethereum-sepolia-rpc.publicnode.com" }) {
+    this.vault = vault;
+    this.vaultId = vaultId;
+    this.mpcPath = mpcPath;
+    this.rpcUrl = rpcUrl;
+  }
+
+  async init() {
+    if (this.pub) return;
+    this.viem = await import("viem");
+    const { sepolia } = await import("viem/chains");
+    this.pub = this.viem.createPublicClient({ chain: sepolia, transport: this.viem.http(this.rpcUrl) });
+    const s = await this.vault.view("get_summary");
+    this.address = s.evm_address;
+  }
+
+  async balances() {
+    await this.init();
+    const erc20 = this.viem.parseAbi(["function balanceOf(address) view returns (uint256)"]);
+    const [eth, weth, usdc, block] = await Promise.all([
+      this.pub.getBalance({ address: this.address }),
+      this.pub.readContract({ address: UNI.weth, abi: erc20, functionName: "balanceOf", args: [this.address] }),
+      this.pub.readContract({ address: UNI.usdc, abi: erc20, functionName: "balanceOf", args: [this.address] }),
+      this.pub.getBlockNumber(),
+    ]);
+    return { eth, weth, usdc, block };
+  }
+
+  async bestQuote(tokenIn, tokenOut, amountIn) {
+    return ChainSigExecutor.prototype.bestQuote.call(this, tokenIn, tokenOut, amountIn);
+  }
+
+  /** Ask the vault to sign one leg; verify; broadcast; wait. */
+  async leg(id, leg, { to, value = 0n, data, amountIn = 0n, amountOutMin = 0n, feeTier = 3000 }) {
+    const { serializeTransaction, keccak256 } = this.viem;
+    const nonce = await this.pub.getTransactionCount({ address: this.address, blockTag: "pending" });
+    const fees = await this.pub.estimateFeesPerGas();
+    let maxFeePerGas = fees.maxFeePerGas * 2n;
+    if (maxFeePerGas > MAX_FEE_CAP) maxFeePerGas = MAX_FEE_CAP;
+    let maxPriorityFeePerGas = fees.maxPriorityFeePerGas ?? 1_000_000_000n;
+    if (maxPriorityFeePerGas > maxFeePerGas) maxPriorityFeePerGas = maxFeePerGas;
+    // estimate per tx (+30%), fallback to defaults; capped at the vault's 400k
+    let gas = GAS[leg];
+    try { gas = (await this.pub.estimateGas({ account: this.address, to, value, data })) * 13n / 10n; } catch { /* e.g. swap before approve is mined */ }
+    if (gas > 400_000n) gas = 400_000n;
+    const tx = { type: "eip1559", chainId: 11155111, nonce, maxFeePerGas, maxPriorityFeePerGas, gas, to, value, data };
+    const localHash = keccak256(serializeTransaction(tx)).slice(2);
+
+    const res = await this.vault.callRaw("sign_evm_tx", {
+      id, leg, nonce,
+      max_fee_per_gas: maxFeePerGas.toString(),
+      max_priority_fee_per_gas: maxPriorityFeePerGas.toString(),
+      gas_limit: Number(gas),
+      amount_in: amountIn.toString(),
+      amount_out_min: amountOutMin.toString(),
+      fee_tier: feeTier,
+    }, 300_000_000_000_000n, "1");
+    const logs = res.receipts_outcome.flatMap((r) => r.outcome.logs);
+    const req = logs.map((l) => l.match(/"event":"evm_sign_requested".*"payload":"([0-9a-f]{64})"/)).find(Boolean);
+    if (!req) throw new Error("vault did not log a sign request");
+    if (req[1] !== localHash) throw new Error(`vault signed ${req[1]} but local tx hashes to ${localHash}: refusing to broadcast`);
+    const sv = res.status?.SuccessValue;
+    const sig = sv ? JSON.parse(Buffer.from(sv, "base64").toString()) : null;
+    if (!sig) throw new Error("MPC signature failed (leg can be retried)");
+    const bigR = sig.big_r.affine_point ?? sig.big_r;
+    const r = `0x${bigR.slice(2)}`;
+    const s = `0x${sig.s.scalar ?? sig.s}`;
+    const raw = serializeTransaction(tx, { r, s, yParity: sig.recovery_id });
+    const hash = await this.pub.sendRawTransaction({ serializedTransaction: raw });
+    try {
+      const rcpt = await this.pub.waitForTransactionReceipt({ hash, timeout: 120_000 });
+      return { step: leg, hash, status: rcpt.status };
+    } catch {
+      return { step: leg, hash, status: "pending-timeout" };
+    }
+  }
+
+  /** Execute an executed (revealed + guardrail-passed) decision. */
+  async executeTrade({ id, commitment, decision, ethUsd, tradeEthWei = 2_000_000_000_000_000n }) {
+    await this.init();
+    const { encodeFunctionData, parseAbi } = this.viem;
+    const erc20 = parseAbi(["function approve(address,uint256) returns (bool)", "function allowance(address,address) view returns (uint256)", "function deposit() payable"]);
+    const routerAbi = parseAbi(["function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96)) payable returns (uint256)"]);
+    const txs = [];
+    const bal = await this.balances();
+    let tokenIn, tokenOut, amountIn;
+    if (decision.action === "sell") {
+      tokenIn = UNI.weth; tokenOut = UNI.usdc; amountIn = tradeEthWei;
+      if (bal.weth < amountIn) {
+        const need = amountIn - bal.weth;
+        txs.push(await this.leg(id, "wrap", { to: UNI.weth, value: need, data: "0xd0e30db0", amountIn: need }));
+      }
+    } else if (decision.action === "buy") {
+      tokenIn = UNI.usdc; tokenOut = UNI.weth; amountIn = bal.usdc / 2n;
+      if (amountIn === 0n) return { ref: null, txs, filled: false, detail: "buy skipped: no USDC to deploy" };
+    } else return { ref: null, txs, filled: false, detail: "hold" };
+
+    const allowance = await this.pub.readContract({ address: tokenIn, abi: erc20, functionName: "allowance", args: [this.address, UNI.router] });
+    if (allowance < amountIn) {
+      txs.push(await this.leg(id, "approve", { to: tokenIn, data: encodeFunctionData({ abi: erc20, functionName: "approve", args: [UNI.router, 2n ** 256n - 1n] }) }));
+    }
+    const q = await this.bestQuote(tokenIn, tokenOut, amountIn);
+    const poolEthUsd = tokenIn === UNI.weth ? (Number(q.out) / 1e6) / (Number(amountIn) / 1e18) : (Number(amountIn) / 1e6) / (Number(q.out) / 1e18);
+    const deviation = ethUsd ? Math.abs(poolEthUsd / ethUsd - 1) : 0;
+    const devNote = `pool ETH $${poolEthUsd.toFixed(0)} vs oracle $${ethUsd?.toFixed(0)} (${(deviation * 100).toFixed(1)}% off)`;
+    if (deviation > 0.05 && process.env.ALLOW_POOL_DEVIATION !== "1") {
+      return { ref: `refused:${devNote}`, txs, filled: false, detail: `REFUSED: ${devNote}` };
+    }
+    const minOut = (q.out * 9_800n) / 10_000n;
+    const data = encodeFunctionData({ abi: routerAbi, functionName: "exactInputSingle",
+      args: [{ tokenIn, tokenOut, fee: q.fee, recipient: this.address, amountIn, amountOutMinimum: minOut, sqrtPriceLimitX96: 0n }] }) + commitment;
+    const swap = await this.leg(id, "swap", { to: UNI.router, data, amountIn, amountOutMin: minOut, feeTier: q.fee });
+    txs.push(swap);
+    const filled = swap.status === "success";
+    return { ref: filled ? swap.hash : `reverted:${swap.hash}`, txs, filled,
+      detail: `${decision.action} via Uniswap v3 ${q.fee / 10000}% · vault-signed · ${devNote}${deviation > 0.05 ? " [testnet override]" : ""}` };
+  }
+}

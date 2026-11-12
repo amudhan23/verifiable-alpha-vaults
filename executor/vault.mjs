@@ -30,6 +30,12 @@ export class NearVault {
     return this._account;
   }
 
+  /** Raw call returning the full outcome (logs, SuccessValue). */
+  async callRaw(methodName, args, gas = 100_000_000_000_000n, deposit = "0") {
+    const account = await this.account();
+    return account.functionCall({ contractId: this.cfg.contractId, methodName, args, gas, attachedDeposit: BigInt(deposit) });
+  }
+
   async call(methodName, args, gas = 100_000_000_000_000n) {
     const account = await this.account();
     const res = await account.functionCall({
@@ -62,7 +68,7 @@ export class NearVault {
 
   async settlePnl(externalValueYocto, evmBlock, attestationRef) {
     await this.call("settle_pnl", {
-      external_value: externalValueYocto,
+      ext_value: externalValueYocto,
       evm_block: evmBlock,
       attestation_ref: attestationRef,
     });

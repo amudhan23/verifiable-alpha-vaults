@@ -221,6 +221,7 @@ async function renderVault(id) {
           <dt>pairs</dt><dd>${g.allowed_pairs.map(esc).join(", ")}</dd>
           <dt>net asset value</dt><dd>${v.pool_near} NEAR</dd>
           ${v.external_near != null ? `<dt>· on NEAR</dt><dd>${v.local_near} NEAR</dd><dt>· cross-chain</dt><dd>${v.external_near} NEAR</dd>` : ""}
+          ${v.evm_address ? `<dt>cross-chain wallet</dt><dd style="font-size:11px"><a href="https://sepolia.etherscan.io/address/${esc(v.evm_address)}" target="_blank" rel="noopener">${esc(v.evm_address.slice(0, 10))}…</a> (vault-owned)</dd>` : ""}
           ${v.last_settlement_ref ? `<dt>last settlement</dt><dd style="font-size:11px">${esc(v.last_settlement_ref.slice(0, 34))}…</dd>` : ""}
           ${v.last_attested_ms ? `<dt>exit guarantee</dt><dd style="font-size:11.5px">${v.emergency ? "EMERGENCY — withdraw pro rata" : `anyone may trigger exit if silent ${Math.round(v.liveness_timeout_ms / 3.6e6)}h (last: ${when(v.last_attested_ms)})`}</dd>` : ""}
           <dt>perf fee</dt><dd>20% above high-water mark</dd>
@@ -272,23 +273,29 @@ async function renderPosition(v) {
   const p = await W.position(v.id, acct);
   const s = p.summary;
   const emergency = s.emergency, stale = s.stale;
-  const claim = p.claim && BigInt(p.claim.claim_yocto) > 0n ? p.claim : null;
+  const ext = p.ext ?? { units: "0", est_value_yocto: "0", claimable_yocto: "0", failed_payout_yocto: "0" };
+  const hasUnits = BigInt(ext.units) > 0n;
+  const claimable = BigInt(ext.claimable_yocto) > 0n;
+  const failed = BigInt(ext.failed_payout_yocto) > 0n;
   box.innerHTML = `<h3>Your position · ${esc(acct)}</h3>
     <dl class="kv" style="margin-bottom:14px">
       <dt>shares</dt><dd>${W.yoctoToNear(p.shares.toString())}</dd>
       <dt>worth now</dt><dd>${W.yoctoToNear(p.value.toString())} NEAR</dd>
-      ${claim ? `<dt>cross-chain claim</dt><dd>${W.yoctoToNear(claim.claim_yocto)} NEAR (paid ${W.yoctoToNear(claim.paid_yocto)})</dd>` : ""}
+      ${p.shares > 0n ? `<dt>withdrawable now</dt><dd>${W.yoctoToNear(p.localSlice.toString())} NEAR</dd>` : ""}
+      ${hasUnits ? `<dt>cross-chain units</dt><dd>≈ ${W.yoctoToNear(ext.est_value_yocto)} NEAR</dd>` : ""}
+      ${claimable ? `<dt>claimable now</dt><dd>${W.yoctoToNear(ext.claimable_yocto)} NEAR</dd>` : ""}
     </dl>
-    ${emergency ? `<p class="v-bad" style="margin:0 0 10px"><b>Emergency exit mode.</b> Withdrawing pays your share of the NEAR pool now and records a claim on cross-chain value.</p>` : ""}
+    ${emergency ? `<p class="v-bad" style="margin:0 0 10px"><b>Emergency exit mode.</b> Trading and deposits are frozen. Withdrawals still pay your exact slice of the NEAR pool and move your slice of the cross-chain wallet to you as claimable units.</p>` : ""}
     <div class="actions">
       ${!emergency ? `<label class="field"><span>Deposit (NEAR)</span><input id="dep-amt" inputmode="decimal" placeholder="1.0" autocomplete="off"></label>
       <button class="primary" data-act="deposit">Deposit</button>` : ""}
       ${p.shares > 0n ? `<label class="field"><span>Withdraw (% of your shares)</span><input id="wd-pct" inputmode="numeric" value="100"></label>
       <button data-act="withdraw">${emergency ? "Emergency withdraw" : "Withdraw"}</button>` : ""}
-      ${claim ? `<button data-act="claim">Claim recovered funds</button>` : ""}
+      ${claimable ? `<button data-act="claim">Claim repatriated NEAR</button>` : ""}
+      ${failed ? `<button data-act="retry">Retry failed payout</button>` : ""}
       ${stale && !emergency ? `<button data-act="emergency" title="The vault has been silent past its liveness timeout">Trigger emergency exit</button>` : ""}
     </div>
-    <p class="muted" id="pos-msg" role="status" style="font-size:12.5px; margin:10px 0 0">${!emergency && p.shares > 0n && p.value > p.local ? "Part of the NAV sits cross-chain; a full withdrawal may wait for the next settlement." : "Each action is a transaction you sign in your own wallet."}</p>
+    <p class="muted" id="pos-msg" role="status" style="font-size:12.5px; margin:10px 0 0">${p.shares > 0n && p.value > p.localSlice ? "Withdrawing pays your NEAR-pool slice now; your cross-chain slice becomes units, paid out as funds are repatriated." : "Each action is a transaction you sign in your own wallet."}</p>
     <p style="margin:6px 0 0; font-size:12.5px"><a href="#" data-act="disconnect">Sign out</a></p>`;
 }
 
@@ -313,7 +320,9 @@ async function onPositionAction(act) {
     } else if (act === "emergency") {
       await W.triggerEmergency();
     } else if (act === "claim") {
-      await W.claimRecovered();
+      await W.claimExternal();
+    } else if (act === "retry") {
+      await W.retryPayout();
     }
     msg("Done. Refreshing…", "v-ok");
     DATA = null; // re-read chain state
