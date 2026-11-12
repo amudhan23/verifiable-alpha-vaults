@@ -15,6 +15,17 @@ things independently verifiable:
 | 3 | **Risk limits held** | Guardrails (leverage ≤ 3x, position caps, asset allowlist) enforced in the contract before anything is signed, **plus** Bulletproofs range proofs that private risk metrics stayed in range — verified in your browser |
 | 4 | **Real returns** | Share accounting and NAV history are on-chain; returns computed from balances + oracle |
 
+### Every claim, checked in your browser
+
+Four seals, four independent checks against public data. None trust our server:
+
+1. **Attested**: TDX attestations fetched from OutLayer's public API; the code that executed = the code the vault recorded (and enforced) for each decision.
+2. **Committed**: every revealed trade recomputes to the hash committed on NEAR *before* execution.
+3. **In limits**: Bulletproof range proofs verified in-browser (leverage ≤ 3x, drawdown ≤ 20%).
+4. **Priced**: each enclave input is published on-chain, hashes to the attested `input_hash`, and its oracle price matches public market history. The strategy provably saw real prices.
+
+Execution is a real Uniswap v3 swap through NEAR Chain Signatures (the commitment rides in the swap's calldata). Cross-chain PnL settles back into NAV through the enclave. Returns are NAV **per share**. Details and every tx: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
 ### What is protected — and what is not
 
 > **The protected asset is the strategy's parameters and its future

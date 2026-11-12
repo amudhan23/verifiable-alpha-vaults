@@ -19,6 +19,8 @@
 //! (see `breach_params_cannot_produce_risk_proof`), and the vault contract
 //! refuses the reveal before anything is signed.
 
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use vault_proofs::{prove_risk, RiskLimits, RiskProofBundle};
@@ -36,6 +38,12 @@ pub struct Params {
     pub size_bps: u64,
     /// Leverage per trade, bps (10_000 = 1x).
     pub leverage_bps: u64,
+    /// Optional 32-byte hex key. When present, the decision+salt leave the
+    /// enclave ONLY as ChaCha20-Poly1305 ciphertext — required for the
+    /// on-chain request path, where stdout lands in a public tx result.
+    /// Shared with the executor out of band; part of the sealed secret.
+    #[serde(default)]
+    pub seal_key_hex: Option<String>,
 }
 
 /// Public per-run input, assembled by the executor from on-chain + oracle data.
@@ -52,6 +60,28 @@ pub struct RunInput {
     /// Vault guardrails (public; must match the contract).
     pub max_leverage_bps: u64,
     pub max_drawdown_bps: u64,
+    /// Optional cross-chain settlement inputs (fetched by the executor; their
+    /// values are bound into the TDX attestation's input hash, so the
+    /// settlement the enclave emits is fraud-provable against the source
+    /// chain at `evm_block`).
+    #[serde(default)]
+    pub settle: Option<SettleInput>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SettleInput {
+    pub eth_balance_wei: String,
+    pub usdc_balance_6dp: String,
+    pub eth_usd: f64,
+    pub near_usd: f64,
+    pub evm_block: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Settlement {
+    /// Cross-chain holdings valued in yoctoNEAR (string).
+    pub external_value_yocto: String,
+    pub evm_block: u64,
 }
 
 /// Decision field order is FIXED: the contract reveals the exact JSON string,
@@ -81,8 +111,13 @@ pub struct RunOutput {
     /// metrics breach the limits (in which case no proof *can* exist).
     pub risk_bundle: Option<RiskProofBundle>,
     pub risk_error: Option<String>,
-    /// Decision + salt for the executor to reveal at execution time.
-    pub sealed: Sealed,
+    /// Decision + salt in the clear — demo/offline mode only (no seal key).
+    pub sealed: Option<Sealed>,
+    /// ChaCha20-Poly1305(nonce ‖ ct ‖ tag) of the Sealed JSON, hex. Only the
+    /// enclave and the executor hold the key.
+    pub sealed_enc: Option<String>,
+    /// Attested valuation of cross-chain holdings, when inputs were given.
+    pub settlement: Option<Settlement>,
 }
 
 fn sma(prices: &[f64], n: usize) -> Option<f64> {
@@ -162,14 +197,42 @@ pub fn run(params: &Params, input: &RunInput, salt: [u8; 32]) -> RunOutput {
         Err(e) => (None, Some(e.to_string())),
     };
 
+    let sealed = Sealed { decision_json, salt_hex: hex::encode(salt) };
+    let (sealed_plain, sealed_enc) = match params.seal_key_hex.as_deref() {
+        Some(key_hex) => {
+            let key_bytes = hex::decode(key_hex).expect("seal_key_hex");
+            let cipher = ChaCha20Poly1305::new_from_slice(&key_bytes).expect("32-byte key");
+            let mut nonce = [0u8; 12];
+            // derive nonce from the salt (unique per run) — no reuse
+            nonce.copy_from_slice(&salt[..12]);
+            let ct = cipher
+                .encrypt(Nonce::from_slice(&nonce), serde_json::to_vec(&sealed).unwrap().as_ref())
+                .expect("encrypt");
+            let mut blob = nonce.to_vec();
+            blob.extend_from_slice(&ct);
+            (None, Some(hex::encode(blob)))
+        }
+        None => (Some(sealed), None),
+    };
+
+    let settlement = input.settle.as_ref().map(|st| {
+        let eth: f64 = st.eth_balance_wei.parse::<u128>().unwrap_or(0) as f64 / 1e18;
+        let usdc: f64 = st.usdc_balance_6dp.parse::<u128>().unwrap_or(0) as f64 / 1e6;
+        let usd = eth * st.eth_usd + usdc; // USDC at par
+        let near = if st.near_usd > 0.0 { usd / st.near_usd } else { 0.0 };
+        Settlement {
+            external_value_yocto: ((near * 1e24) as u128).to_string(),
+            evm_block: st.evm_block,
+        }
+    });
+
     RunOutput {
         commitment,
         risk_bundle,
         risk_error,
-        sealed: Sealed {
-            decision_json,
-            salt_hex: hex::encode(salt),
-        },
+        sealed: sealed_plain,
+        sealed_enc,
+        settlement,
     }
 }
 
@@ -179,7 +242,7 @@ mod tests {
     use vault_proofs::verify_risk;
 
     fn params() -> Params {
-        Params { fast: 3, slow: 8, threshold_bps: 50, size_bps: 4_000, leverage_bps: 25_000 }
+        Params { fast: 3, slow: 8, threshold_bps: 50, size_bps: 4_000, leverage_bps: 25_000, seal_key_hex: None }
     }
 
     fn input(prices: Vec<f64>) -> RunInput {
@@ -192,6 +255,7 @@ mod tests {
             peak_nav_yocto: "1000".into(), // 5% drawdown
             max_leverage_bps: 30_000,
             max_drawdown_bps: 2_000,
+            settle: None,
         }
     }
 
@@ -230,8 +294,8 @@ mod tests {
     fn commitment_binds_decision_and_salt() {
         let out = run(&params(), &input(rising()), [7u8; 32]);
         // recompute like the contract does
-        let mut pre = out.sealed.decision_json.as_bytes().to_vec();
-        pre.extend_from_slice(&hex::decode(&out.sealed.salt_hex).unwrap());
+        let mut pre = out.sealed.as_ref().unwrap().decision_json.as_bytes().to_vec();
+        pre.extend_from_slice(&hex::decode(&out.sealed.as_ref().unwrap().salt_hex).unwrap());
         let digest = hex::encode(sha2::Sha256::digest(&pre));
         assert_eq!(digest, out.commitment);
         // a different salt yields a different commitment
@@ -260,8 +324,47 @@ mod tests {
         let out = run(&greedy, &input(rising()), [1u8; 32]);
         assert!(out.risk_bundle.is_none());
         assert!(out.risk_error.unwrap().contains("exceeds limit"));
-        let d: Decision = serde_json::from_str(&out.sealed.decision_json).unwrap();
+        let d: Decision = serde_json::from_str(&out.sealed.as_ref().unwrap().decision_json).unwrap();
         assert_eq!(d.leverage_bps, 100_000);
+    }
+
+    #[test]
+    fn sealed_encryption_roundtrip_and_privacy() {
+        let key = [9u8; 32];
+        let p = Params { seal_key_hex: Some(hex::encode(key)), ..params() };
+        let out = run(&p, &input(rising()), [7u8; 32]);
+        assert!(out.sealed.is_none(), "no plaintext decision may leave the enclave");
+        let blob = hex::decode(out.sealed_enc.unwrap()).unwrap();
+        use chacha20poly1305::aead::{Aead, KeyInit};
+        let cipher = chacha20poly1305::ChaCha20Poly1305::new_from_slice(&key).unwrap();
+        let pt = cipher
+            .decrypt(chacha20poly1305::Nonce::from_slice(&blob[..12]), &blob[12..])
+            .unwrap();
+        let sealed: Sealed = serde_json::from_slice(&pt).unwrap();
+        // the decrypted reveal matches the public commitment
+        let mut pre = sealed.decision_json.as_bytes().to_vec();
+        pre.extend_from_slice(&hex::decode(&sealed.salt_hex).unwrap());
+        assert_eq!(hex::encode(sha2::Sha256::digest(&pre)), out.commitment);
+    }
+
+    #[test]
+    fn settlement_is_computed_from_attested_inputs() {
+        let mut inp = input(rising());
+        inp.settle = Some(SettleInput {
+            eth_balance_wei: "50000000000000000".into(), // 0.05 ETH
+            usdc_balance_6dp: "25000000".into(),         // 25 USDC
+            eth_usd: 3000.0,
+            near_usd: 5.0,
+            evm_block: 777,
+        });
+        let out = run(&params(), &inp, [1u8; 32]);
+        let s = out.settlement.unwrap();
+        // 0.05*3000 + 25 = 175 USD -> 35 NEAR (f64 valuation: allow 1e-6 rel)
+        let got: u128 = s.external_value_yocto.parse().unwrap();
+        let want = 35u128 * 10u128.pow(24);
+        let diff = got.abs_diff(want);
+        assert!(diff < want / 1_000_000, "got {got}, want ~{want}");
+        assert_eq!(s.evm_block, 777);
     }
 
     #[test]

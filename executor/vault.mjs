@@ -41,11 +41,12 @@ export class NearVault {
     return res;
   }
 
-  async commitDecision(commitment, wasmHash, attestationRef) {
+  async commitDecision(commitment, wasmHash, attestationRef, inputJson = null) {
     const res = await this.call("commit_decision", {
       commitment,
       wasm_hash: wasmHash,
       attestation_ref: attestationRef,
+      input_json: inputJson,
     });
     const status = res.status?.SuccessValue;
     return status ? Number(JSON.parse(Buffer.from(status, "base64").toString())) : 0;
@@ -57,6 +58,14 @@ export class NearVault {
 
   async postRiskProof(epoch, bundleJson) {
     await this.call("post_risk_proof", { epoch, bundle_json: bundleJson });
+  }
+
+  async settlePnl(externalValueYocto, evmBlock, attestationRef) {
+    await this.call("settle_pnl", {
+      external_value: externalValueYocto,
+      evm_block: evmBlock,
+      attestation_ref: attestationRef,
+    });
   }
 
   async recordExecutionRef(id, executionRef) {
@@ -76,7 +85,7 @@ export class DryRunVault {
     this.proofs = [];
   }
 
-  async commitDecision(commitment, wasmHash, attestationRef) {
+  async commitDecision(commitment, wasmHash, attestationRef, inputJson = null) {
     if (wasmHash !== this.approved) {
       throw new Error("attested code hash does not match approved strategy; deposits paused");
     }
@@ -103,6 +112,10 @@ export class DryRunVault {
 
   async postRiskProof(epoch, bundleJson) {
     this.proofs.push({ epoch, bundleJson });
+  }
+
+  async settlePnl(externalValueYocto, evmBlock) {
+    this.external = { externalValueYocto, evmBlock };
   }
 
   async recordExecutionRef(id, executionRef) {

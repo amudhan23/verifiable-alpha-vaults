@@ -42,7 +42,7 @@ async function loadData() {
   return DATA;
 }
 
-const fmtPct = (p) => (p == null ? "—" : `${p >= 0 ? "+" : ""}${p.toFixed(2)}%`);
+const fmtPct = (p) => (p == null ? "—" : Math.abs(p) < 0.005 ? "0.00%" : `${p > 0 ? "+" : ""}${p.toFixed(2)}%`);
 const short = (h, n = 10) => (h ? `${h.slice(0, n)}…${h.slice(-4)}` : "—");
 const when = (ms) => {
   const d = Date.now() - ms;
@@ -182,7 +182,8 @@ async function renderVault(id) {
           <div><span class="lbl">salt</span>&nbsp; ${c.salt_hex} ${copyBtn(c.salt_hex)}</div>` : ""}
           ${c.reject_reason ? `<div class="v-bad" style="margin-top:6px">refused by guardrails: ${esc(c.reject_reason)}</div>` : ""}
           ${c.attestation_ref ? `<div style="margin-top:6px"><span class="lbl">attestation</span>&nbsp; ${c.attestation_ref.startsWith("https://") ? `<a href="${esc(c.attestation_ref)}" target="_blank" rel="noopener">${esc(c.attestation_ref)}</a>` : esc(c.attestation_ref)} <span class="lbl">· wasm</span> ${short(c.wasm_hash)}</div>` : ""}
-          ${c.execution_ref ? `<div><span class="lbl">target-chain tx</span>&nbsp; ${esc(c.execution_ref)}</div>` : ""}
+          ${c.execution_ref ? `<div><span class="lbl">target-chain tx</span>&nbsp; ${c.execution_ref.startsWith("0x") ? `<a href="https://sepolia.etherscan.io/tx/${esc(c.execution_ref)}" target="_blank" rel="noopener">${esc(c.execution_ref)}</a> <span class="lbl">(Uniswap v3 on Sepolia; the last 32 bytes of its calldata are this commitment)</span>` : esc(c.execution_ref)}</div>` : ""}
+          ${c.input_json ? (() => { const o = JSON.parse(c.input_json).oracle; return o ? `<div><span class="lbl">prices the enclave saw</span>&nbsp; ETH $${o.eth_usd} · NEAR $${o.near_usd} · ${esc(o.spot_source)} @ ${new Date(o.as_of * 1000).toISOString().slice(0, 16).replace("T", " ")} UTC</div>` : ""; })() : ""}
         </div>
         ${c.revealed ? `<button data-recompute="${c.id}">Recompute this hash</button><span class="check-line" id="recompute-${c.id}" role="status"></span>` : ""}
       </td></tr>`;
@@ -200,21 +201,24 @@ async function renderVault(id) {
         <span id="b-code">${chip("wait", "code unchecked")}</span>
         <span id="b-trades">${chip("wait", "trades unchecked")}</span>
         <span id="b-risk">${chip("wait", "risk unchecked")}</span>
+        <span id="b-prices">${chip("wait", "prices unchecked")}</span>
         <button class="primary" id="run-checks">Run all checks</button>
       </div>
     </div>
-    <p class="certline">This page certifies that every decision below was committed on NEAR before it executed anywhere, attested by Intel TDX to the approved code, and bounded by the stated guardrails — or shows you exactly where that failed.</p>
+    <p class="certline">This page certifies that every decision below was committed on NEAR before it executed anywhere, attested by Intel TDX to the approved code, computed from real market prices, and bounded by the stated guardrails — or shows you exactly where that failed.</p>
     <div class="stamp-row" id="stamps" aria-live="polite"></div>
     ${v.integrity_alert ? `<div class="alert"><b>Integrity alert — deposits paused.</b> A decision arrived attested to different code: <code>${esc(v.integrity_alert)}</code></div>` : ""}
     <div class="cols">
-      <div class="panel"><h3>Net asset value${v.return_pct == null ? "" : ` · ${fmtPct(v.return_pct)}`}</h3>${navChart(v)}</div>
+      <div class="panel"><h3>Net asset value${v.return_pct == null ? "" : ` · ${fmtPct(v.return_pct)} per share`}</h3>${navChart(v)}${v.external_near > 0 ? `<p class="muted" style="font-size:12.5px; font-style:italic; margin:8px 0 0">The step up is seed capital bridged to the cross-chain wallet. It was minted as shares at NAV/share, so it changed the vault’s size, not its return.</p>` : ""}</div>
       <div class="panel"><h3>Terms of issue</h3>
         <dl class="kv">
           <dt>max leverage</dt><dd>${(g.max_leverage_bps / 10000).toFixed(1)}x</dd>
           <dt>max drawdown</dt><dd>${(g.max_drawdown_bps / 100).toFixed(0)}%</dd>
           <dt>max position</dt><dd>${(g.max_position_bps / 100).toFixed(0)}% of NAV</dd>
           <dt>pairs</dt><dd>${g.allowed_pairs.map(esc).join(", ")}</dd>
-          <dt>pool</dt><dd>${v.pool_near} NEAR</dd>
+          <dt>net asset value</dt><dd>${v.pool_near} NEAR</dd>
+          ${v.external_near != null ? `<dt>· on NEAR</dt><dd>${v.local_near} NEAR</dd><dt>· cross-chain</dt><dd>${v.external_near} NEAR</dd>` : ""}
+          ${v.last_settlement_ref ? `<dt>last settlement</dt><dd style="font-size:11px">${esc(v.last_settlement_ref.slice(0, 34))}…</dd>` : ""}
           <dt>perf fee</dt><dd>20% above high-water mark</dd>
           <dt>manager</dt><dd title="holder of the strategy NFT">${esc(v.manager)}</dd>
         </dl>
@@ -233,6 +237,7 @@ async function renderVault(id) {
       <div class="check-row"><span class="what">Attested code: TDX attestations fetched from OutLayer; executed wasm equals the approved strategy</span><span class="result muted" id="r-code">not run</span></div>
       <div class="check-row"><span class="what">Every revealed trade recomputes to its pre-execution commitment (SHA-256, WebCrypto)</span><span class="result muted" id="r-trades">not run</span></div>
       <div class="check-row"><span class="what">Bulletproof range proofs: private risk metrics stayed within the guardrails</span><span class="result muted" id="r-risk">not run</span></div>
+      <div class="check-row"><span class="what">Real prices: each published enclave input hashes to its attested input, and its oracle price matches public market history</span><span class="result muted" id="r-prices">not run</span></div>
     </div>`;
 }
 
@@ -244,7 +249,7 @@ async function onRunChecks() {
     const el = $(sel);
     if (el) el.innerHTML = `<span class="${{ ok: "v-ok", bad: "v-bad", wait: "v-wait" }[r.state]}">${{ ok: "✓", bad: "✗", wait: "–" }[r.state]} ${esc(r.detail)}</span>`;
   };
-  ["#b-code", "#b-trades", "#b-risk"].forEach((s) => { const el = $(s); if (el) el.innerHTML = `<span class="chip running"><span class="dot"></span>checking…</span>`; });
+  ["#b-code", "#b-trades", "#b-risk", "#b-prices"].forEach((s) => { const el = $(s); if (el) el.innerHTML = `<span class="chip running"><span class="dot"></span>checking…</span>`; });
   const stamps = $("#stamps");
   if (stamps) stamps.innerHTML = "";
   const addStamp = (r, words) => {
@@ -254,12 +259,15 @@ async function onRunChecks() {
   const codeL = label({ ok: "code attested", bad: "code mismatch", wait: "code unchecked" });
   const tradesL = label({ ok: "trades committed", bad: "back-fill detected", wait: "trades unchecked" });
   const riskL = label({ ok: "risk proven", bad: "risk breach", wait: "risk unproven" });
+  const priceL = label({ ok: "prices verified", bad: "prices forged", wait: "prices unchecked" });
   await runAllChecks(v, {
     onCode: (r) => { setChip("#b-code", r.state, codeL(r)); setRes("#r-code", r); addStamp(r, { ok: "ATTESTED", bad: "VOID", wait: "UNVERIFIED" }); },
     onTrades: (r) => { setChip("#b-trades", r.state, tradesL(r)); setRes("#r-trades", r); addStamp(r, { ok: "COMMITTED", bad: "VOID", wait: "UNVERIFIED" }); },
     onRisk: (r) => { setChip("#b-risk", r.state, riskL(r)); setRes("#r-risk", r); addStamp(r, { ok: "IN LIMITS", bad: "VOID", wait: "UNPROVEN" }); },
     onTradeStep: (id) => { const el = $("#r-trades"); if (el) el.textContent = `recomputing #${id}…`; },
     onRiskStep: (ep) => { const el = $("#r-risk"); if (el) el.textContent = `verifying epoch ${ep}…`; },
+    onPrices: (r) => { setChip("#b-prices", r.state, priceL(r)); setRes("#r-prices", r); addStamp(r, { ok: "PRICED", bad: "VOID", wait: "UNPRICED" }); },
+    onPriceStep: (id) => { const el = $("#r-prices"); if (el) el.textContent = `hashing enclave input #${id}…`; },
     onCodeStep: (id) => { const el = $("#r-code"); if (el) el.textContent = `fetching TDX attestation for #${id}…`; },
   });
 }

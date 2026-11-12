@@ -49,3 +49,20 @@ fixed, and verified: on-chain errors now read `Smart contract panicked: …`.
 
 Known ledger artifacts kept honestly: #3/#4 forever `Committed` (sealed) from
 executor-crash runs; #6 the rejected 10x breach; #7–#8 red-team targets.
+
+## Thursday upgrade: the core loop, closed (12 Nov)
+
+| Gap | Status | Evidence |
+|---|---|---|
+| **Real oracle, bound into the attestation** | ✅ live | Executor fetches Pyth (→ CoinGecko fallback) and puts prices + timestamp in the enclave input. The vault publishes the exact `input_json`; `sha256(input_json)` = the TDX attestation's `input_hash` (verified: commitment #10 ↔ call `d56d3cfc…`, hash `f001685e…`). The browser re-checks the price against CoinGecko's public history at `as_of` (±2%). Feeding the strategy fake prices is now detectable. |
+| **Real DEX execution** | ✅ live | Uniswap v3 on Sepolia (SwapRouter02 `0x3bFA…e48E`, addresses verified on-chain). Commitment #10: [wrap](https://sepolia.etherscan.io/tx/0xb29a03063124cdf929c87fed3ac19c32b98f3ee1257f14c1287fd29e24c278eb) → [approve](https://sepolia.etherscan.io/tx/0x7d5ed8d56a7ead8d20a42f3479fe83df55c61cd232e8a2a7060f382191b119ec) → [swap WETH→USDC](https://sepolia.etherscan.io/tx/0xa6f00795ad319fce27c3b74c64193fb00ff3249fc6522678d7ae097a3baa535f), all MPC-signed. Best fee tier via QuoterV2, 2% `amountOutMinimum`, receipt-checked (a revert is recorded as `reverted:<hash>`, never as a fill). The 32-byte commitment is appended after the ABI args, so every swap is tied to its NEAR commitment. |
+| **PnL settles into NAV** | ✅ live | `settle_pnl`: the enclave values cross-chain holdings from balances in its (attested, published) input; anyone can re-read Sepolia at `evm_block` and compare. The first settlement is booked as **seed capital** (shares minted at NAV/share) so out-of-band funding can never show up as return. Returns are computed from NAV **per share**. |
+| **De-trust the executor (yield/resume)** | ⚠️ implemented, testnet worker unresponsive | `request_decision` makes the vault itself call `outlayer.testnet` `request_execution` with the build **pinned** (`version_key` = approved hash; OutLayer confirmed: "Resolved project … version: 1592…"). The decision + salt come back as ChaCha20-Poly1305 ciphertext (`sealed_enc`) because callback results are public. In 3 attempts (both WasmUrl and Project sources) the testnet worker never resumed within NEAR's 200-block yield window, while the HTTPS path answers in <1s, so live cycles use HTTPS. Txs: `FcWvc7jf…`, `HTCNWMh2…`. |
+
+### New safety rails
+- **Pool-vs-oracle deviation guard (5%)**: refuses to trade into a pool priced away from the oracle (manipulation / thin liquidity). Sepolia pools trade about 14× off real ETH prices, so testnet swaps require the explicit `ALLOW_POOL_DEVIATION=1` override, and the measured deviation is recorded with the trade. **Consequence, stated plainly:** the cycle-#10 testnet swap filled at the mispriced pool, so the next settlement will show a paper gain that a mainnet pool would not produce.
+- **Secret access locked down**: the hash-keyed secret row is whitelisted to the vault + owner and locked to the exact build. Otherwise anyone could run the public wasm with our sealed params on crafted inputs and probe the strategy until they reverse-engineered it.
+
+### Bugs found and fixed (on the live vault)
+- **u128 overflow in share math.** `amount × total_shares` in yoctoNEAR (1e24 × 1e24) exceeds u128, and `saturating_mul` silently clamped it. The seed settlement minted about 3.4e14 shares instead of 29.6e24, and *any* second 1-NEAR deposit would have been mis-minted. Fixed with 256-bit `mul_div` everywhere (deposit, withdraw, fees, settlement), plus tests at real yocto scale (the old tests used tiny numbers and missed it). Live state repaired via a one-time `#[private] repair_seed_mint`, deployed **atomically** with the fix (tx `4vt3tyNV…`): NAV/share is back to 1.000.
+- **State-layout change on upgrade.** New fields would have bricked the deployed vault's borsh state. Fixed with a v1→v2 `migrate`, unit-tested on real v1 state and deployed atomically with the code (tx `2rKbS8yd…`): all 10 commitments preserved.

@@ -33,6 +33,7 @@ fn vault() -> Vault {
         acct("amudhan.testnet"),
         acct("executor.testnet"),
         WASM_HASH.into(),
+        "https://test.fastfs.io/demo.wasm".into(),
         Guardrails {
             max_leverage_bps: 30_000,
             max_drawdown_bps: 2_000,
@@ -52,6 +53,7 @@ fn market_input() -> RunInput {
         peak_nav_yocto: "1000".into(),
         max_leverage_bps: 30_000,
         max_drawdown_bps: 2_000,
+        settle: None,
     }
 }
 
@@ -70,16 +72,17 @@ fn full_pipeline_honest_vault() {
         threshold_bps: 50,
         size_bps: 4_000,
         leverage_bps: 25_000,
+        seal_key_hex: None,
     };
     let out = run(&sealed_params, &market_input(), [42u8; 32]);
     let bundle = out.risk_bundle.expect("honest run proves risk");
 
     // executor commits the hash FIRST (this is what makes back-filling impossible)
     ctx("executor.testnet", 0);
-    let id = v.commit_decision(out.commitment.clone(), WASM_HASH.into(), "outlayer-exec-1".into());
+    let id = v.commit_decision(out.commitment.clone(), WASM_HASH.into(), "outlayer-exec-1".into(), None);
 
     // ...trade executes on the target chain... then reveal
-    v.execute_decision(id, out.sealed.decision_json.clone(), out.sealed.salt_hex.clone());
+    v.execute_decision(id, out.sealed.as_ref().unwrap().decision_json.clone(), out.sealed.as_ref().unwrap().salt_hex.clone());
     let c = v.get_commitment(id).unwrap();
     assert_eq!(c.status, CommitmentStatus::Executed);
 
@@ -108,6 +111,7 @@ fn full_pipeline_greedy_params_are_stopped_twice() {
         threshold_bps: 50,
         size_bps: 4_000,
         leverage_bps: 100_000,
+        seal_key_hex: None,
     };
     let out = run(&greedy, &market_input(), [42u8; 32]);
 
@@ -116,8 +120,8 @@ fn full_pipeline_greedy_params_are_stopped_twice() {
 
     // layer 2: the contract refuses the reveal before anything is signed
     ctx("executor.testnet", 0);
-    let id = v.commit_decision(out.commitment.clone(), WASM_HASH.into(), "outlayer-exec-2".into());
-    v.execute_decision(id, out.sealed.decision_json, out.sealed.salt_hex);
+    let id = v.commit_decision(out.commitment.clone(), WASM_HASH.into(), "outlayer-exec-2".into(), None);
+    v.execute_decision(id, out.sealed.as_ref().unwrap().decision_json.clone(), out.sealed.as_ref().unwrap().salt_hex.clone());
     let c = v.get_commitment(id).unwrap();
     assert_eq!(c.status, CommitmentStatus::Rejected);
     assert!(c.reject_reason.unwrap().contains("exceeds max"));
@@ -127,30 +131,30 @@ fn full_pipeline_greedy_params_are_stopped_twice() {
 #[should_panic(expected = "was not committed when claimed")]
 fn full_pipeline_backfilled_winner_is_caught() {
     let mut v = vault();
-    let params = Params { fast: 3, slow: 8, threshold_bps: 50, size_bps: 4_000, leverage_bps: 25_000 };
+    let params = Params { fast: 3, slow: 8, threshold_bps: 50, size_bps: 4_000, leverage_bps: 25_000, seal_key_hex: None };
 
     // honest commit...
     let out = run(&params, &market_input(), [42u8; 32]);
     ctx("executor.testnet", 0);
-    let id = v.commit_decision(out.commitment, WASM_HASH.into(), "outlayer-exec-3".into());
+    let id = v.commit_decision(out.commitment, WASM_HASH.into(), "outlayer-exec-3".into(), None);
 
     // ...but the manager tries to reveal a different, winning trade
     let mut fake_input = market_input();
     fake_input.prices = vec![120., 120., 120., 120., 120., 117., 112., 106., 100., 95.];
     let fake = run(&params, &fake_input, [42u8; 32]);
-    v.execute_decision(id, fake.sealed.decision_json, fake.sealed.salt_hex);
+    v.execute_decision(id, fake.sealed.as_ref().unwrap().decision_json.clone(), fake.sealed.as_ref().unwrap().salt_hex.clone());
 }
 
 #[test]
 fn full_pipeline_swapped_code_is_detected() {
     let mut v = vault();
-    let params = Params { fast: 3, slow: 8, threshold_bps: 50, size_bps: 4_000, leverage_bps: 25_000 };
+    let params = Params { fast: 3, slow: 8, threshold_bps: 50, size_bps: 4_000, leverage_bps: 25_000, seal_key_hex: None };
     let out = run(&params, &market_input(), [42u8; 32]);
     ctx("executor.testnet", 0);
     // attestation says different code ran: recorded as Rejected (not a panic,
     // which would revert the alert on-chain) and deposits pause
     let other_hash = "ab".repeat(32);
-    let id = v.commit_decision(out.commitment, other_hash, "outlayer-exec-4".into());
+    let id = v.commit_decision(out.commitment, other_hash, "outlayer-exec-4".into(), None);
     assert_eq!(v.get_commitment(id).unwrap().status, CommitmentStatus::Rejected);
     assert!(v.deposits_paused);
     ctx("alice.testnet", 1_000);

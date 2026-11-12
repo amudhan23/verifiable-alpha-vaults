@@ -85,10 +85,11 @@ fn simulate(v: &SimVault) -> serde_json::Value {
             peak_nav_yocto: peak_yocto.clone(),
             max_leverage_bps: limits.max_leverage_bps,
             max_drawdown_bps: limits.max_drawdown_bps,
+            settle: None,
         };
         let salt = rng.salt();
         let out = run(&v.params, &input, salt);
-        let decision: serde_json::Value = serde_json::from_str(&out.sealed.decision_json).unwrap();
+        let decision: serde_json::Value = serde_json::from_str(&out.sealed.as_ref().unwrap().decision_json.clone()).unwrap();
         let action = decision["action"].as_str().unwrap().to_string();
         let over_limit = decision["leverage_bps"].as_u64().unwrap() > limits.max_leverage_bps;
 
@@ -100,8 +101,8 @@ fn simulate(v: &SimVault) -> serde_json::Value {
             "attestation_ref": format!("local-sim-{}", e + 1),
             "committed_at_ms": now,
             "status": status,
-            "revealed": out.sealed.decision_json,
-            "salt_hex": out.sealed.salt_hex,
+            "revealed": out.sealed.as_ref().unwrap().decision_json.clone(),
+            "salt_hex": out.sealed.as_ref().unwrap().salt_hex.clone(),
             "reject_reason": if over_limit { serde_json::json!(format!("leverage {}bps exceeds max {}bps", decision["leverage_bps"], limits.max_leverage_bps)) } else { serde_json::Value::Null },
             "execution_ref": if over_limit || action == "hold" { serde_json::Value::Null } else { serde_json::json!(format!("0x{:064x}", rng.next())) },
         }));
@@ -166,7 +167,7 @@ fn main() {
     let honest = SimVault {
         name: "Momentum Alpha",
         account: "momentum-alpha.vaults.testnet",
-        params: Params { fast: 3, slow: 8, threshold_bps: 40, size_bps: 4_000, leverage_bps: 25_000 },
+        params: Params { fast: 3, slow: 8, threshold_bps: 40, size_bps: 4_000, leverage_bps: 25_000, seal_key_hex: None },
         seed: 11,
         drift: 0.008,
         post_proofs: true,
@@ -177,7 +178,7 @@ fn main() {
     let greedy = SimVault {
         name: "Degen Max",
         account: "degen-max.vaults.testnet",
-        params: Params { fast: 2, slow: 5, threshold_bps: 10, size_bps: 4_500, leverage_bps: 100_000 },
+        params: Params { fast: 2, slow: 5, threshold_bps: 10, size_bps: 4_500, leverage_bps: 100_000, seal_key_hex: None },
         seed: 99,
         drift: -0.002,
         post_proofs: true,
@@ -187,7 +188,7 @@ fn main() {
     let swapped = SimVault {
         name: "Shadow Fork",
         account: "shadow-fork.vaults.testnet",
-        params: Params { fast: 3, slow: 8, threshold_bps: 40, size_bps: 3_000, leverage_bps: 20_000 },
+        params: Params { fast: 3, slow: 8, threshold_bps: 40, size_bps: 3_000, leverage_bps: 20_000, seal_key_hex: None },
         seed: 13,
         drift: 0.001,
         post_proofs: false,

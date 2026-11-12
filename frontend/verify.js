@@ -46,23 +46,25 @@ export async function checkTradesCommitted(vault, onStep = () => {}) {
   return { state: "ok", detail: `${okCount}/${revealed.length} commitments recomputed in this browser` };
 }
 
-/** Badge 1 (quick, sync): on-chain hash comparison for leaderboard chips. */
+/** Badge 1 (quick, sync): on-chain state only, for leaderboard chips.
+ * The contract records each decision's attested wasm hash and refuses (and
+ * pauses deposits) if it differs from the hash approved AT THAT MOMENT, so
+ * the on-chain signal of a swap is the integrity alert / a code rejection.
+ * A strategy rotation by the NFT holder is legitimate and logged. */
 export function checkCodeAttested(vault) {
   if (vault.integrity_alert) return { state: "bad", detail: vault.integrity_alert };
-  const honored = vault.commitments.filter((c) => c.reject_reason == null || !c.reject_reason.includes("code hash"));
-  const mismatched = honored.filter((c) => c.wasm_hash !== vault.approved_wasm_hash);
-  if (mismatched.length > 0)
-    return { state: "bad", detail: `${mismatched.length} decisions attested to different code` };
+  const swapped = vault.commitments.filter((c) => c.reject_reason?.includes("code hash"));
+  if (swapped.length > 0)
+    return { state: "bad", detail: `${swapped.length} decisions arrived attested to unapproved code` };
   if (vault.commitments.length === 0) return { state: "wait", detail: "no attested decisions yet" };
-  return {
-    state: "ok",
-    detail: `${vault.commitments.length} decisions attested to ${vault.approved_wasm_hash.slice(0, 12)}…`,
-  };
+  const builds = [...new Set(vault.commitments.map((c) => c.wasm_hash))];
+  const rot = builds.length > 1 ? ` across ${builds.length} approved builds (${builds.length - 1} logged rotation${builds.length > 2 ? "s" : ""})` : "";
+  return { state: "ok", detail: `${vault.commitments.length} decisions attested${rot}; current build ${vault.approved_wasm_hash.slice(0, 12)}…` };
 }
 
-/** Badge 1 (deep): additionally FETCH the TDX attestations from OutLayer's
- * public API and compare the executed wasm sha256 against the approved hash.
- * Real third-party verification — the API is public and CORS-open. */
+/** Badge 1 (deep): fetch each TDX attestation from OutLayer's public API and
+ * check the code that ACTUALLY executed equals the hash the contract recorded
+ * (and enforced) for that decision. Real third-party verification. */
 export async function checkCodeAttestedDeep(vault, onStep = () => {}) {
   const quick = checkCodeAttested(vault);
   if (quick.state !== "ok") return quick;
@@ -75,17 +77,18 @@ export async function checkCodeAttestedDeep(vault, onStep = () => {}) {
     try {
       const att = await (await fetch(c.attestation_ref)).json();
       const executed = att.executed_wasm_sha256 ?? att.wasm_hash;
-      if (executed !== vault.approved_wasm_hash)
-        return { state: "bad", detail: `attestation for #${c.id}: executed wasm ${String(executed).slice(0, 12)}… ≠ approved` };
+      if (executed !== c.wasm_hash)
+        return { state: "bad", detail: `#${c.id}: TDX says ${String(executed).slice(0, 12)}… ran, vault recorded ${c.wasm_hash.slice(0, 12)}…` };
       if (!att.tdx_quote) return { state: "bad", detail: `attestation for #${c.id} has no TDX quote` };
       verified++;
     } catch {
       return { state: "wait", detail: `attestation for #${c.id} not reachable right now` };
     }
   }
+  const builds = new Set(vault.commitments.map((c) => c.wasm_hash)).size;
   return {
     state: "ok",
-    detail: `${verified} TDX attestations fetched from OutLayer; executed wasm = approved on all`,
+    detail: `${verified} TDX attestations fetched: executed code = recorded code on all${builds > 1 ? ` (${builds - 1} logged strategy rotation)` : ""}`,
   };
 }
 
@@ -142,6 +145,42 @@ export async function checkRiskProven(vault, onStep = () => {}) {
   };
 }
 
+/** Check 4: the strategy saw REAL prices. For every decision that published
+ * its enclave input: sha256(input_json) must equal the TDX attestation's
+ * input_hash, and the oracle price inside must match CoinGecko's public
+ * history at that timestamp (±2%). */
+export async function checkPricesVerified(vault, onStep = () => {}) {
+  const withInput = vault.commitments.filter((c) => c.input_json && c.attestation_ref?.startsWith("https://")).slice(-4);
+  if (withInput.length === 0) return { state: "wait", detail: "no decisions with published inputs yet" };
+  let hashed = 0, crossChecked = 0;
+  for (const c of withInput) {
+    onStep(c.id);
+    const att = await (await fetch(c.attestation_ref)).json().catch(() => null);
+    if (!att) return { state: "wait", detail: `attestation for #${c.id} not reachable` };
+    const h = await sha256Hex(new TextEncoder().encode(c.input_json));
+    if (h !== att.input_hash)
+      return { state: "bad", detail: `#${c.id}: published input does not hash to the attested input_hash` };
+    hashed++;
+    const o = JSON.parse(c.input_json).oracle;
+    if (o?.as_of && o.eth_usd) {
+      try {
+        const r = await fetch(`https://api.coingecko.com/api/v3/coins/ethereum/market_chart/range?vs_currency=usd&from=${o.as_of - 900}&to=${o.as_of + 900}`);
+        const pts = (await r.json()).prices ?? [];
+        if (pts.length) {
+          const near = pts.reduce((a, b) => (Math.abs(b[0] / 1000 - o.as_of) < Math.abs(a[0] / 1000 - o.as_of) ? b : a));
+          if (Math.abs(near[1] / o.eth_usd - 1) > 0.02)
+            return { state: "bad", detail: `#${c.id}: enclave saw ETH $${o.eth_usd}, public history says $${near[1].toFixed(2)}` };
+          crossChecked++;
+        }
+      } catch { /* public history unreachable: hash check still holds */ }
+    }
+  }
+  return {
+    state: "ok",
+    detail: `${hashed} enclave inputs match their attested input_hash${crossChecked ? `; ${crossChecked} oracle prices match public history (±2%)` : ""}`,
+  };
+}
+
 export async function runAllChecks(vault, hooks = {}) {
   const code = await checkCodeAttestedDeep(vault, hooks.onCodeStep);
   hooks.onCode?.(code);
@@ -149,5 +188,7 @@ export async function runAllChecks(vault, hooks = {}) {
   hooks.onTrades?.(trades);
   const risk = await checkRiskProven(vault, hooks.onRiskStep);
   hooks.onRisk?.(risk);
-  return { code, trades, risk };
+  const prices = await checkPricesVerified(vault, hooks.onPriceStep);
+  hooks.onPrices?.(prices);
+  return { code, trades, risk, prices };
 }

@@ -42,10 +42,11 @@ export class LiveVault {
     ]);
     const toNear = (yocto) => Number(BigInt(yocto) / 10n ** 20n) / 10_000;
     const navHistory = navLog.map((p) => ({ t: p.t, nav: toNear(p.pool_yocto) }));
-    const returnPct =
-      navHistory.length >= 2 && navHistory[0].nav > 0
-        ? ((navHistory.at(-1).nav / navHistory[0].nav) - 1) * 100
-        : null;
+    // Return from NAV per SHARE (first deposit mints 1:1, so NAV/share starts
+    // at 1.0). Seed capital and deposits move NAV but never the share price.
+    const nav = BigInt(s.nav_yocto ?? s.pool_yocto);
+    const shares = BigInt(s.total_shares);
+    const returnPct = shares > 0n ? (Number((nav * 1_000_000n) / shares) / 1_000_000 - 1) * 100 : null;
     return {
       id: this.contractId,
       name: this.contractId,
@@ -53,7 +54,10 @@ export class LiveVault {
       live: true,
       approved_wasm_hash: s.approved_wasm_hash,
       guardrails: s.guardrails,
-      pool_near: toNear(s.pool_yocto),
+      pool_near: toNear(s.nav_yocto ?? s.pool_yocto),
+      local_near: toNear(s.pool_yocto),
+      external_near: toNear(s.external_value_yocto ?? "0"),
+      last_settlement_ref: s.last_settlement_ref,
       total_shares: s.total_shares,
       nav_history: navHistory,
       return_pct: returnPct,
