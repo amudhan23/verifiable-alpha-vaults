@@ -19,11 +19,11 @@ working exploit tests.
 | **H2** High | Storage griefing: free account creation, an unbounded NAV log, and uncapped strings could exhaust the contract's balance and trap the last withdrawers. | 0.1 NEAR minimum deposit, NAV log as a 2,000-entry ring buffer, caps on every string argument. | `nav_log_is_a_bounded_ring_buffer` plus the `access_control_and_input_checks` tests. |
 | **M1** | Input checks were skippable, and the enclave trusted any price. | `input_json` is mandatory and re-checked in the on-chain callback. The enclave refuses non-finite or non-positive prices (no proof and no settlement). | Contract and strategy tests. |
 | **M2** | Selling the strategy NFT didn't move operational control. | Decisions can be requested by the executor or the **NFT holder**. Rotations require the NFT holder. | `fees_respect_hwm_and_go_to_the_nft_holder`. |
-| **M3** | Code rotation was instant and silenced the integrity alert. | `propose_strategy` → **48h** → `apply_strategy`, and the alert is only cleared then. Wallet rotation is timelocked the same way. | `strategy_and_wallet_rotations_are_timelocked`. Live: new strategy proposed, effective Sat 14 Nov 17:24 UTC. |
+| **M3** | Code rotation was instant and silenced the integrity alert. | `propose_strategy` → **48h** → `apply_strategy`, and the alert is only cleared then. *(v5: wallet rotation removed; proposals bound to the proposer.)* | `strategy_rotation_is_timelocked_and_bound_to_the_proposer`. Live: strategy v2 proposed, effective Sat 14 Nov 17:51 UTC. |
 | **M4** | A deposit at NAV 0 handed the money to existing holders. | Deposits are refused when NAV and shares disagree. | `deposit_refused_when_nav_and_shares_disagree`. |
 | **M5** | `repair_seed_mint` was reusable. | **Removed.** | — |
 | **L1** | Failed transfers vanished from the books. | Every payout goes through `pay()`; failures are credited to `failed_payouts` and can be retried with `retry_payout`. | `failed_transfer_is_credited_back`. |
-| **L2** | Fee timing was gameable; the high-water mark wasn't reset when the vault emptied. | Fees only crystallize on a valuation that has stood for 24h, never in emergency. The HWM resets when the last holder exits. | Unit tests and fuzz S7. |
+| **L2** | Fee timing was gameable; the high-water mark wasn't reset when the vault emptied. | Fees only crystallize on a valuation that has stood for 24h, never in emergency. The HWM resets when the last holder exits. *(v5: fees only on realized gains; see Review 2.)* | Unit tests and fuzz S7. |
 
 ### What the strengthened fuzzer caught in our own fix
 
@@ -35,15 +35,51 @@ actual NEAR held, adversarial settlements, repatriation and claims) found
 
 The suite runs 300 random scenarios in CI. We ran 600 locally at the end; all invariants hold.
 
+## Review 2 (12 Nov): independent review of v4
+
+A second reviewer attacked v4 and asked a sharper question: in the mode that
+actually runs today, what can the relayer still do? Its answer was more than
+our v4 write-up admitted. Two claims above were wrong and are corrected here:
+
+- *"`request_decision` removes valuation trust."* Only if it is the **only**
+  path. In v4 the executor could still call `settle_pnl` directly. And even on
+  the on-chain path, the market inputs (prices, balances) come from whoever
+  requests the run. The contract checks the vault-state part of the input,
+  not the prices.
+- *"2% slippage is enforced on-chain."* It wasn't. In v4 the executor passed
+  `amount_out_min` and `amount_in` to `sign_evm_tx`. The contract only checked
+  that the floor was non-zero.
+
+| # | Finding (v4) | v5 response |
+|---|---|---|
+| **K1** Critical | The vault account's full-access key is the owner/executor key. Whoever holds it can redeploy the contract and bypass every rule. | Code changes now have a public path: `propose_code(sha256)` → **48h** → `apply_code` (anyone can submit the code; it must hash to the proposal; deploys and calls `migrate`). **The full-access key is deleted after the final deploy (Sat 14 Nov)**, which leaves `apply_code` as the only way to upgrade. Until then this is the top residual risk, stated in the README. |
+| **X1–X4** High | In relayed mode the contract can't verify that a valuation came from the enclave. The reported value fed deposit pricing (a lowballed NAV sells cheap shares to a colluder), fee crystallization, and the chart. The ±10%/h bound slows this down but doesn't stop it. | The valuation no longer touches money: **deposits only open while `ext_value == 0`** (fully in NEAR, priced by NEAR the contract holds) and **fees only crystallize while `ext_value == 0`** (realized gains only). Withdrawals never read it (v4). What remains is a chart a relayer could misdraw, and the EVM block it names lets anyone check. **Attested mode** (`enable_attested`, immediate; `propose_relayed` → 48h to go back) blocks `commit_decision`, `settle_pnl` and executor proofs. Only `on_decision` output from OutLayer's `request_execution` can then commit, reveal, settle or anchor a proof hash. |
+| **X5** High | The relayer chose the trade size and the slippage floor of every vault-signed swap. | **The enclave decides them** (strategy v2). `amount_in`, `min_out` (oracle −2%) and `fee_tier` are fields of the committed decision. `sign_evm_tx` takes only nonce, gas price and gas limit (capped per leg: wrap 200k, approve 120k, swap 400k, 100 gwei) plus a deadline within the next hour. The swap is a `multicall(deadline, …)`. Decisions from pre-v2 strategies carry no size and can't be signed at all. Rust and viem calldata are checked byte-for-byte in a unit test. |
+| **W1** High | `propose_wallet` could rotate the vault's EVM wallet (timelocked, but it could redirect every future swap). | **Removed.** `evm_address` is fixed for the life of the vault. |
+| **P1** Medium | Proposals outlived a sale of the strategy NFT: the old manager's proposal could still be applied. | Proposals record their proposer; `apply_*` requires that the proposer still holds the NFT. `cancel_proposals` for the current manager. |
+| **S1** Medium | The relayer's writes (inputs up to 6 KB, bundles up to 8 KB) were paid from the contract's balance, which is shareholders' NEAR. | Every relayed write is `#[payable]` and charges the exact `storage_usage` delta (excess refunded). `request_decision` keeps 0.1 NEAR back for its callback's storage. |
+| **S2** Medium | (Found by us while deploying v5.) The v4 code was 853 KB unstripped, which locked ~8.5 NEAR of storage stake and left the vault with **less free balance than its pool owed**. | Built with `-C link-arg=-s` plus `wasm-opt -Oz`: **393 KB**, freeing ~4.6 NEAR. After the migration the free balance covers the pool. |
+| **E1** Medium | Cross-chain value has no on-chain redemption leg (no bridge). | Unchanged: stated as a residual. Units are an enforceable pro-rata claim on whatever is repatriated, and `repatriate` is permissionless. |
+| **M** Low | Migration nits: v3→v4 reset `last_settlement_ms`, and pending proposals didn't carry over. | v4→v5 preserves both. A pending wallet rotation blocks the migration. |
+
+Tests: 22 unit tests (new: attested delivery commits, reveals, settles and
+gates proofs; attested mode locks out the relayer; timelocked mode reversal;
+hash-bound timelocked code upgrade; proposer-bound rotation; deposits only
+while fully in NEAR; fees only on realized gains; enclave-sized multicall
+swap). Fuzz invariants **S8** (a deposit never succeeds while value is
+cross-chain) and a tightened **S7** (no fee while value is cross-chain) were
+added; 400 random scenarios pass. Deployed and migrated on testnet (tx
+`EGUedioDCU5v8GJptkCN5HaKZFeCRG6DmiNkvGndFTWJ`). The first live relayed cycle
+on v5 committed, revealed and anchored a proof with the relayer paying its own
+storage.
+
 ## Residual risks (stated, not hidden)
 
-- **Valuation is still relayed by a semi-trusted executor.** It is computed in the enclave from published, attested inputs and is fraud-provable (re-read Sepolia at `evm_block`). It can no longer extract NEAR, but within the ±10%/h bound it can skew **deposit pricing**. This is removed entirely by the on-chain attested path (`request_decision`: only DCAP-verified OutLayer workers can resolve it), which is built but waiting on OutLayer's testnet worker.
-- **Front-running window:** the decision is revealed on NEAR seconds before the swap lands on Sepolia. The 2% `amountOutMinimum` bounds the loss; on mainnet, submit through a private mempool.
-- **Cross-chain funds depend on NEAR's MPC network** to ever move. Exit guarantees cover the NEAR side fully and make the cross-chain side an enforceable pro-rata claim. They can't remove the MPC dependency, which is inherent to Chain Signatures.
-- **The contract is upgradeable by its full-access key** (we used that to ship these fixes on testnet). For mainnet: delete the key, or put upgrades behind the same 48h timelock.
-- **Sepolia pools are mispriced** (~10–14× real ETH), so testnet trades produce paper PnL a real pool wouldn't. The 5% pool-vs-oracle guard refuses such trades unless explicitly overridden.
-
-## Review 2
-
-A second independent review of v4 is in progress; its findings and our
-responses will be recorded here.
+- **Until Saturday the vault account still has a full-access key.** Whoever holds it can replace the code. We delete it after the final deploy. After that, code changes take 48h and are public (`propose_code`).
+- **Relayed mode trusts the relayer for liveness and for the chart.** It can withhold runs (the 24h liveness rule then lets anyone trigger emergency exit) or misreport the cross-chain valuation shown on the NAV chart. It can't move NEAR, price deposits, cash fees, size trades or pick a trade the enclave didn't commit.
+- **Attested mode is built but not live.** OutLayer's testnet worker never resumes on-chain `request_execution` calls (5 attempts, including a tiny-output probe). The vault stays in relayed mode until it does.
+- **Market inputs are supplied by the requester, even in attested mode.** The contract checks the vault-state part of the input but not prices or balances. The browser's price check compares each published input against public market history. The next step is an enclave that fetches its own prices (wasip2 HTTP).
+- **Front-running window:** the decision becomes public when it is revealed (or delivered, in attested mode), shortly before the swap lands. The enclave's 2% floor and the 1h deadline bound the loss. On mainnet, submit through a private mempool.
+- **Cross-chain funds depend on NEAR's MPC network** to ever move, and have no on-chain bridge back (repatriation is a manual sale and bridge followed by `repatriate`).
+- **Sepolia pools are mispriced** (~10–14× real ETH). The enclave's oracle-based floor makes swaps into a bad pool unfillable; the executor checks the quote and refuses before spending gas.
+- **No rate limit** on relayed calls beyond the 1h settlement spacing. Each write is self-funded (storage), so spam costs the spammer.

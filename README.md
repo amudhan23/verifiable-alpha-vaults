@@ -17,10 +17,16 @@ things independently verifiable:
 
 ### Security, reviewed adversarially
 
-An independent review of v3 found **3 Critical issues** (the executor could drain the pool through misreported valuations; the cross-chain wallet was the executor's, not the vault's; claims could overpay). **v4 fixes all of them, on the live vault**:
-- Withdrawals pay an exact slice of the pool and never read the valuation.
-- The vault builds and MPC-signs its own transactions; recipients are locked to itself.
-- Repatriated value is paid out solvent to the yocto.
+Two independent reviews attacked the vault. The first found **3 Critical issues in v3**: the executor could drain the pool through misreported valuations, the cross-chain wallet was the executor's rather than the vault's, and claims could overpay. v4 fixed all three. The second asked what the relayer can *still* do. **v5 (live) answers with two honest modes:**
+
+- **Relayed** (running today): a named relayer delivers enclave output. It is trusted for liveness and for the valuation shown on the chart, and for nothing else.
+  - Trade sizes and slippage floors come from the enclave's committed decision.
+  - Deposits only open while the vault is fully in NEAR.
+  - Fees only come from NEAR that has actually returned.
+  - Withdrawals pay an exact pool slice.
+  - The vault's EVM wallet can never change.
+  - The relayer pays for every byte it writes.
+- **Attested** (built, switches on when OutLayer's on-chain worker resumes calls): only TDX-attested output delivered on-chain can commit, trade, settle or prove. Switching it on is immediate; switching back takes 48h.
 
 Every finding, fix and regression test, plus the residual risks, is in [`docs/SECURITY.md`](docs/SECURITY.md).
 
@@ -33,11 +39,11 @@ Four seals, four independent checks against public data. None trust our server:
 3. **In limits**: Bulletproof range proofs verified in-browser (leverage ≤ 3x, drawdown ≤ 20%).
 4. **Priced**: each enclave input is published on-chain, hashes to the attested `input_hash`, and its oracle price matches public market history. The strategy provably saw real prices.
 
-Execution is a real Uniswap v3 swap through NEAR Chain Signatures (the commitment rides in the swap's calldata). Cross-chain PnL settles back into NAV through the enclave. Returns are NAV **per share**. Details and every tx: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+Execution is a real Uniswap v3 swap through NEAR Chain Signatures. The **vault contract** builds and MPC-signs the transaction. It uses exactly the amount, 2% floor and fee tier the enclave committed, and the commitment rides in the swap's calldata. Cross-chain PnL settles back into NAV through the enclave. Returns are NAV **per share**. Details and every tx: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ### Use it
 
-Open a live vault page, **Connect wallet** (Meteor, MyNearWallet or Intear on NEAR testnet), and deposit or withdraw. Each action is a transaction you sign in your own wallet. If the vault ever goes silent past its liveness timeout, the same panel offers **Trigger emergency exit** and **Claim recovered funds**.
+Open a live vault page, **Connect wallet** (Meteor, MyNearWallet or Intear on NEAR testnet), and deposit or withdraw. Each action is a transaction you sign in your own wallet. Deposits are open only while all of the vault's value is NEAR held by the contract, so a valuation report never sets the price you pay. If the vault ever goes silent past its liveness timeout, the same panel offers **Trigger emergency exit** and **Claim recovered funds**.
 
 ### What is protected — and what is not
 
@@ -72,7 +78,7 @@ investor ──deposit──► Vault contract (NEAR, near-sdk Rust)
                       browser verifies: attestation · commitments · range proofs
 ```
 
-- Performance fees respect an on-chain **high-water mark** (fee shares mint to the manager only on new highs), and the strategy itself is a **NEP-171 NFT**: whoever holds it earns the fees and may rotate the code (loudly — rotation is an on-chain event). Sell the NFT and the verified track record goes with it.
+- Performance fees respect an on-chain **high-water mark** and are charged only on **realized** gains. The strategy itself is a **NEP-171 NFT**: whoever holds it earns the fees and may propose code, mode and contract changes. Each one is public for 48h before it applies, and it lapses if the NFT is sold. Sell the NFT and the verified track record goes with it.
 
 - `crates/proofs` — Pedersen commitments + aggregated Bulletproofs proving
   `secret value ≤ public limit` (a 10x-leverage epoch **cannot produce a
@@ -82,7 +88,8 @@ investor ──deposit──► Vault contract (NEAR, near-sdk Rust)
 - `strategy` — public momentum strategy code, **sealed parameters** via
   OutLayer secrets (env-injected inside the enclave only).
 - `scripts/` — OutLayer setup + testnet go/no-go.
-- `frontend/` — leaderboard, vault page, three verification badges (WIP).
+- `executor/` — the relayer: oracle → enclave → commit → reveal → vault-signed swap → proof → bounded settlement.
+- `frontend/` — registry, vault pages with four in-browser checks, wallet sign-in, Counterfeit Bureau.
 
 ## Run everything (no network needed)
 
@@ -130,8 +137,10 @@ The frontend ships a console that runs the three cheats live:
 
 ## Testnet deployment
 
-See `scripts/outlayer-setup.md`, then `scripts/go-no-go.sh`. (Deployment
-details and live contract addresses land here once deployed.)
+Live vault: `vault.alpha-vaults-23.testnet` (v5). Its EVM wallet on Sepolia is
+`0x63fbAd3b0Ee56433861907EE75963e59326D9B6f`. Contract addresses, transactions
+and the upgrade history are in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md). To
+set up your own: `scripts/outlayer-setup.md`, then `node executor/deploy.mjs`.
 
 ## Trust model, stated plainly
 
@@ -141,15 +150,23 @@ details and live contract addresses land here once deployed.)
   quote) is independently checkable; the worker image, once approved in the
   registry, is trusted to run the WASM it names.
 - **On-chain** (enforced by the vault): code-hash match, enclave-input state
-  consistency (no doctored NAV), commitment ordering, guardrails, liveness-based
-  emergency exit. **Hardware attestation on-chain** arrives via OutLayer's
-  yield/resume path (built: `request_decision`; only DCAP-verified worker keys
-  can resolve it). The testnet worker hasn't served it yet, so live cycles use
-  HTTPS, with attestations verified by anyone off-chain. See
-  `docs/DEPLOYMENT.md` → "Attestation verification".
+  consistency (no doctored NAV), commitment ordering, guardrails, enclave-sized
+  trades only, deposits only while fully in NEAR, fees only on realized gains,
+  liveness-based emergency exit.
+- **Relayed mode (live today)** trusts the relayer for two things: running on
+  time, and the cross-chain valuation drawn on the chart. Its attestations are
+  checkable off-chain by anyone (the four seals). **Attested mode** removes the
+  relayer from both: only OutLayer's on-chain `request_execution`, which only
+  DCAP-verified TDX workers can resolve, can act. It's built and tested, but
+  OutLayer's testnet worker doesn't resume on-chain calls yet. The market
+  inputs are still supplied by the requester in either mode; the browser's
+  price check compares them against public history.
 - **Exit guarantees:** if no attested decision lands for 24h, anyone can
-  trigger a one-way emergency exit; withdrawals pay the NEAR pool pro rata and
-  record claims on cross-chain value. The MPC path rotation is timelocked 48h.
+  trigger a one-way emergency exit. Withdrawals pay the NEAR pool pro rata and
+  record claims on cross-chain value. The vault's EVM wallet is fixed forever.
+- **Upgrades:** after the final deploy the vault account's full-access key is
+  deleted. From then on, code can only change through `propose_code` → 48h →
+  `apply_code`, with the new code's hash public the whole time.
 - **The enclave is not the enforcement point.** Even a malicious strategy
   (or malicious parameters) cannot exceed the guardrails: the contract checks
   every reveal before an execution signature exists.

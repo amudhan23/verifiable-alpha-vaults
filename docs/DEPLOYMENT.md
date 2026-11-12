@@ -107,3 +107,11 @@ Investigated against OutLayer's TEE docs and the testnet register contract:
 - **Recorded code hash = attested hash:** the executor now reads `executed_wasm_sha256` from the attestation and passes that to the vault, never its own config.
 - **Strategy rotation under timelock:** `fcb26364…` (adds enclave price validation) proposed; applicable **Sat 14 Nov 17:24 UTC**. The approved `f9a93278…` stays active until then.
 - Commitments #13/#14: artifacts of the cutover (#13 committed before the executor was reordered; #14's legs reverted out-of-gas before per-tx gas estimation). Both are displayed honestly.
+
+## v5 (12 Nov, after review 2), live
+
+- **Strategy v2** `f64b6537…` ran in OutLayer's TDX worker (call `85f8e4f8…`). The attestation reports `executed_wasm_sha256 = f64b6537…`, its build-locked secret row loaded, and its compact output is 565 bytes (the on-chain limit is 900). It sizes every trade inside the enclave. Proposed on the vault (tx `HE8s5eQL…`), applicable **Sat 14 Nov 17:51 UTC**. It supersedes the `fcb26364…` proposal, which v2 includes (price validation).
+- **Contract v5:** atomic deploy + `migrate` (tx `EGUedioDCU5v8GJptkCN5HaKZFeCRG6DmiNkvGndFTWJ`). All 17 commitments, the external units, `last_settlement_ms` and the pending strategy proposal (now bound to its proposer) were preserved. A follow-up code-only redeploy (tx `3wGBapLf…`) made `commit_decision` payable, which the first live cycle caught.
+- **Code size 853 KB → 393 KB** (`-C link-arg=-s` + `wasm-opt -Oz`). That freed ~4.6 NEAR of storage stake: the unstripped v4 code had left the vault with less free balance than its pool owed.
+- **First v5 cycle** (relayed): commitment #17, guardrail-checked reveal, Bulletproof bundle anchored, with the relayer paying its own storage. Settlement was correctly skipped (1h spacing).
+- **Deposits are closed** on this vault while its cross-chain wallet holds value (~43.8 NEAR at the last settlement). They reopen when that value is repatriated as NEAR.
