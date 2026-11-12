@@ -395,6 +395,11 @@ impl Vault {
             commitment.len() == 64 && hex::decode(&commitment).is_ok(),
             "commitment must be 32 bytes hex"
         );
+        if let Some(ij) = &input_json {
+            if let Err(e) = self.check_input_state(ij) {
+                env::panic_str(&e);
+            }
+        }
         let id = self.commitments.len() as u64;
 
         if wasm_hash != self.approved_wasm_hash {
@@ -723,7 +728,7 @@ impl Vault {
             "emergency_triggered",
             serde_json::json!({
                 "by": env::predecessor_account_id(),
-                "last_attested_ms": self.last_attested_ms,
+            "last_attested_ms": self.last_attested_ms,
                 "pool_yocto": self.pool.to_string(),
                 "external_value_yocto": self.external_value.to_string(),
             }),
@@ -848,6 +853,7 @@ impl Vault {
             "nav_yocto": self.nav().to_string(),
             "last_settlement_ref": self.last_settlement_ref,
             "strategy_wasm_url": self.strategy_wasm_url,
+            "hwm_nav_per_share": self.hwm_nav_per_share.to_string(),
             "last_attested_ms": self.last_attested_ms,
             "liveness_timeout_ms": self.liveness_timeout_ms,
             "stale": self.is_stale(),
@@ -979,6 +985,35 @@ impl Vault {
             ts_ms: env::block_timestamp_ms(),
             pool_yocto: self.nav(),
         });
+    }
+
+    /// The enclave's input must describe THIS vault as it is right now:
+    /// pool, shares, high-water mark, settled external value, guardrails.
+    /// Otherwise the executor could flatter the risk proof with fake NAV.
+    fn check_input_state(&self, input_json: &str) -> Result<(), String> {
+        let v: serde_json::Value =
+            serde_json::from_str(input_json).map_err(|_| "input_json is not JSON".to_string())?;
+        let Some(vs) = v.get("vault_state") else {
+            return Err("input_json has no vault_state: risk would not be bound to real positions".into());
+        };
+        let want = [
+            ("pool_yocto", self.pool.to_string()),
+            ("total_shares", self.total_shares.to_string()),
+            ("hwm_nps", self.hwm_nav_per_share.to_string()),
+            ("external_value_yocto", self.external_value.to_string()),
+        ];
+        for (k, w) in want {
+            let got = vs.get(k).and_then(|x| x.as_str()).unwrap_or("");
+            if got != w {
+                return Err(format!("enclave input vault_state.{k}={got} but the vault has {w}"));
+            }
+        }
+        if vs["max_leverage_bps"].as_u64() != Some(self.guardrails.max_leverage_bps)
+            || vs["max_drawdown_bps"].as_u64() != Some(self.guardrails.max_drawdown_bps)
+        {
+            return Err("enclave input guardrails differ from the vault's".into());
+        }
+        Ok(())
     }
 
     fn assert_executor(&self) {
@@ -1285,6 +1320,35 @@ mod tests {
             .attached_deposit(NearToken::from_yoctonear(deposit))
             .block_timestamp(ts_ms * 1_000_000)
             .build());
+    }
+
+    fn state_input(v: &Vault) -> String {
+        serde_json::json!({"vault_state": {
+            "pool_yocto": v.pool.to_string(), "total_shares": v.total_shares.to_string(),
+            "hwm_nps": v.hwm_nav_per_share.to_string(), "external_value_yocto": v.external_value.to_string(),
+            "max_leverage_bps": 30_000, "max_drawdown_bps": 2_000 }}).to_string()
+    }
+
+    #[test]
+    fn commit_rejects_doctored_vault_state() {
+        let mut v = new_vault();
+        ctx(investor(), 1_000);
+        v.deposit();
+        ctx(executor(), 0);
+        // honest input lands
+        v.commit_decision("a".repeat(64), WASM_HASH.into(), "x".into(), Some(state_input(&v)));
+        // executor inflates the pool to hide a drawdown -> refused
+        let mut fake: serde_json::Value = serde_json::from_str(&state_input(&v)).unwrap();
+        fake["vault_state"]["pool_yocto"] = serde_json::json!("999999");
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            v.commit_decision("b".repeat(64), WASM_HASH.into(), "x".into(), Some(fake.to_string()))
+        }));
+        assert!(r.is_err());
+        // input without vault_state -> refused
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            v.commit_decision("c".repeat(64), WASM_HASH.into(), "x".into(), Some("{}".into()))
+        }));
+        assert!(r.is_err());
     }
 
     #[test]

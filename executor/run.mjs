@@ -48,9 +48,12 @@ const onChain = arg("vault", "dry") === "near";
 const vault = onChain
   ? new NearVault({ contractId: need("VAULT_CONTRACT_ID"), accountId: need("NEAR_ACCOUNT_ID"), privateKey: need("NEAR_PRIVATE_KEY") })
   : new DryRunVault({ approvedWasmHash: APPROVED_WASM_HASH });
-const evm = arg("execute", "sim") === "evm"
+// read-only balance access on every live cycle (risk + settlement are
+// computed from real holdings); swaps only with --execute evm
+const chainsig = onChain
   ? new ChainSigExecutor({ accountId: need("NEAR_ACCOUNT_ID"), privateKey: need("NEAR_PRIVATE_KEY") })
   : null;
+const evm = arg("execute", "sim") === "evm" ? chainsig : null;
 
 /** Decrypt the enclave's sealed payload (ChaCha20-Poly1305, key = SEAL_KEY_HEX). */
 async function unseal(output) {
@@ -68,8 +71,8 @@ async function cycle() {
   console.log(`→ oracle: ${market.oracle.spot_source} · ETH $${market.oracle.eth_usd} · NEAR $${market.oracle.near_usd}`);
 
   let settle = null;
-  if (evm) {
-    const b = await evm.balances();
+  if (chainsig) {
+    const b = await chainsig.balances();
     settle = {
       eth_balance_wei: (b.eth + b.weth).toString(),
       usdc_balance_6dp: b.usdc.toString(),
@@ -89,17 +92,21 @@ async function cycle() {
     max_leverage_bps: 30000, max_drawdown_bps: 2000,
     oracle: market.oracle,
     ...(settle ? { settle } : {}),
+    // checked against the contract's own state when the commitment lands
+    ...(summary ? { vault_state: {
+      pool_yocto: summary.pool_yocto,
+      total_shares: summary.total_shares,
+      hwm_nps: summary.hwm_nav_per_share,
+      external_value_yocto: summary.external_value_yocto,
+      max_leverage_bps: summary.guardrails.max_leverage_bps,
+      max_drawdown_bps: summary.guardrails.max_drawdown_bps,
+    } } : {}),
   };
 
   console.log(`→ enclave run (epoch ${epoch})`);
   const { output, attestationRef, callId, timeMs } = await enclave.run(input);
   console.log(`  done in ${timeMs}ms · call ${callId}`);
   const sealed = await unseal(output);
-
-  if (output.settlement) {
-    console.log(`→ settle cross-chain value into NAV: ${(Number(output.settlement.external_value_yocto) / 1e24).toFixed(4)} NEAR @ evm block ${output.settlement.evm_block}`);
-    await vault.settlePnl(output.settlement.external_value_yocto, output.settlement.evm_block, attestationRef);
-  }
 
   console.log("→ commit on vault (before execution) + publish the exact enclave input");
   const id = await vault.commitDecision(output.commitment, APPROVED_WASM_HASH, attestationRef, JSON.stringify(input));
@@ -123,7 +130,15 @@ async function cycle() {
 
   if (output.risk_bundle) {
     await vault.postRiskProof(epoch, JSON.stringify(output.risk_bundle));
-    console.log("→ Bulletproof risk bundle anchored");
+    console.log(`→ Bulletproof risk bundle anchored (basis: ${output.risk_basis || "decision"})`);
+  } else if (output.risk_error) {
+    console.log(`→ NO risk proof possible: ${output.risk_error}`);
+  }
+
+  // settle last: the state checked at commit must not move mid-cycle
+  if (output.settlement) {
+    console.log(`→ settle cross-chain value into NAV: ${(Number(output.settlement.external_value_yocto) / 1e24).toFixed(4)} NEAR @ evm block ${output.settlement.evm_block}`);
+    await vault.settlePnl(output.settlement.external_value_yocto, output.settlement.evm_block, attestationRef);
   }
   const after = onChain ? await vault.view("get_summary") : await vault.view();
   console.log("\ncycle complete:", JSON.stringify({ commitments: after.commitments, risk_proofs: after.risk_proofs, nav_yocto: after.nav_yocto }, null, 0));

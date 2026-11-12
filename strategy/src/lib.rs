@@ -66,6 +66,56 @@ pub struct RunInput {
     /// chain at `evm_block`).
     #[serde(default)]
     pub settle: Option<SettleInput>,
+    /// Vault state at snapshot time. The CONTRACT checks these against its
+    /// own state when the commitment lands, so the executor can't doctor
+    /// NAV/peak to flatter the risk proof.
+    #[serde(default)]
+    pub vault_state: Option<VaultState>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VaultState {
+    pub pool_yocto: String,
+    pub total_shares: String,
+    /// High-water mark NAV/share, scaled 1e12 (contract's NPS_SCALE).
+    pub hwm_nps: String,
+    pub external_value_yocto: String,
+    pub max_leverage_bps: u64,
+    pub max_drawdown_bps: u64,
+}
+
+/// Risk computed from ACTUAL holdings (vault pool + cross-chain balances x
+/// oracle), not from what the strategy says it is doing.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RealRisk {
+    /// Risky (non-base, non-stable) exposure / NAV, bps.
+    pub exposure_bps: u64,
+    /// max(actual exposure, leverage the new decision requests), bps.
+    pub leverage_bps: u64,
+    /// Drop of current NAV/share below the on-chain high-water mark, bps.
+    pub drawdown_bps: u64,
+}
+
+const NPS_SCALE: f64 = 1e12;
+
+pub fn real_risk(vs: &VaultState, st: &SettleInput, decision: &Decision) -> RealRisk {
+    let yocto = 1e24_f64;
+    let pool = vs.pool_yocto.parse::<f64>().unwrap_or(0.0) / yocto;
+    let shares = vs.total_shares.parse::<f64>().unwrap_or(0.0) / yocto;
+    let hwm = vs.hwm_nps.parse::<f64>().unwrap_or(NPS_SCALE) / NPS_SCALE;
+    let eth = st.eth_balance_wei.parse::<f64>().unwrap_or(0.0) / 1e18;
+    let usdc = st.usdc_balance_6dp.parse::<f64>().unwrap_or(0.0) / 1e6;
+    let (eth_near, usdc_near) = if st.near_usd > 0.0 {
+        (eth * st.eth_usd / st.near_usd, usdc / st.near_usd)
+    } else {
+        (0.0, 0.0)
+    };
+    let nav = pool + eth_near + usdc_near;
+    let exposure_bps = if nav > 0.0 { (eth_near / nav * 10_000.0).round() as u64 } else { 0 };
+    let requested = if decision.action == "hold" { 0 } else { decision.leverage_bps };
+    let nps = if shares > 0.0 { nav / shares } else { 1.0 };
+    let drawdown_bps = if nps < hwm && hwm > 0.0 { ((hwm - nps) / hwm * 10_000.0).round() as u64 } else { 0 };
+    RealRisk { exposure_bps, leverage_bps: exposure_bps.max(requested), drawdown_bps }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -118,6 +168,10 @@ pub struct RunOutput {
     pub sealed_enc: Option<String>,
     /// Attested valuation of cross-chain holdings, when inputs were given.
     pub settlement: Option<Settlement>,
+    /// Which risk basis the proof covers: "positions" (actual holdings,
+    /// contract-checked inputs) or "decision" (legacy/offline).
+    #[serde(default)]
+    pub risk_basis: String,
 }
 
 fn sma(prices: &[f64], n: usize) -> Option<f64> {
@@ -184,10 +238,19 @@ pub fn run(params: &Params, input: &RunInput, salt: [u8; 32]) -> RunOutput {
     hasher.update(salt);
     let commitment = hex::encode(hasher.finalize());
 
-    // Risk metrics for this run: leverage the vault would be at if the
-    // decision executes, and current drawdown vs the high-water mark.
-    let run_leverage = if decision.action == "hold" { 0 } else { decision.leverage_bps };
-    let dd = drawdown_bps(&input.nav_yocto, &input.peak_nav_yocto);
+    // Risk metrics: from ACTUAL positions when the vault state + balances
+    // are in the input (live path); else from the decision (offline/legacy).
+    let (run_leverage, dd, risk_basis) = match (&input.vault_state, &input.settle) {
+        (Some(vs), Some(st)) => {
+            let r = real_risk(vs, st, &decision);
+            (r.leverage_bps, r.drawdown_bps, "positions")
+        }
+        _ => (
+            if decision.action == "hold" { 0 } else { decision.leverage_bps },
+            drawdown_bps(&input.nav_yocto, &input.peak_nav_yocto),
+            "decision",
+        ),
+    };
     let limits = RiskLimits {
         max_leverage_bps: input.max_leverage_bps,
         max_drawdown_bps: input.max_drawdown_bps,
@@ -233,6 +296,7 @@ pub fn run(params: &Params, input: &RunInput, salt: [u8; 32]) -> RunOutput {
         sealed: sealed_plain,
         sealed_enc,
         settlement,
+        risk_basis: risk_basis.into(),
     }
 }
 
@@ -256,6 +320,7 @@ mod tests {
             max_leverage_bps: 30_000,
             max_drawdown_bps: 2_000,
             settle: None,
+            vault_state: None,
         }
     }
 
@@ -365,6 +430,52 @@ mod tests {
         let diff = got.abs_diff(want);
         assert!(diff < want / 1_000_000, "got {got}, want ~{want}");
         assert_eq!(s.evm_block, 777);
+    }
+
+    fn vs(pool_near: u128, shares_near: u128, hwm: f64) -> VaultState {
+        VaultState {
+            pool_yocto: (pool_near * 10u128.pow(24)).to_string(),
+            total_shares: (shares_near * 10u128.pow(24)).to_string(),
+            hwm_nps: ((hwm * 1e12) as u128).to_string(),
+            external_value_yocto: "0".into(),
+            max_leverage_bps: 30_000,
+            max_drawdown_bps: 2_000,
+        }
+    }
+    fn holdings(eth: f64, usdc: f64) -> SettleInput {
+        SettleInput {
+            eth_balance_wei: ((eth * 1e18) as u128).to_string(),
+            usdc_balance_6dp: ((usdc * 1e6) as u128).to_string(),
+            eth_usd: 2000.0, near_usd: 4.0, evm_block: 1,
+        }
+    }
+
+    #[test]
+    fn risk_comes_from_real_positions() {
+        // 10 NEAR pool + 0.05 ETH (=25 NEAR) -> 25/35 = 71.4% exposure
+        let hold = Decision { action: "hold".into(), pair: "ETH/USDC".into(), size_bps: 0, leverage_bps: 0, epoch: 1, nonce: 1 };
+        let r = real_risk(&vs(10, 35, 1.0), &holdings(0.05, 0.0), &hold);
+        assert_eq!(r.exposure_bps, 7143);
+        assert_eq!(r.leverage_bps, 7143, "hold: bounded by what is actually held");
+        assert_eq!(r.drawdown_bps, 0);
+        // a decision requesting 2.5x makes the bound the larger of the two
+        let buy = Decision { action: "buy".into(), leverage_bps: 25_000, ..hold.clone() };
+        assert_eq!(real_risk(&vs(10, 35, 1.0), &holdings(0.05, 0.0), &buy).leverage_bps, 25_000);
+    }
+
+    #[test]
+    fn drawdown_uses_onchain_high_water_mark() {
+        // NAV 28 over 35 shares = 0.8/share vs HWM 1.0 -> 20% drawdown
+        let hold = Decision { action: "hold".into(), pair: "ETH/USDC".into(), size_bps: 0, leverage_bps: 0, epoch: 1, nonce: 1 };
+        let r = real_risk(&vs(3, 35, 1.0), &holdings(0.05, 0.0), &hold);
+        assert_eq!(r.drawdown_bps, 2000);
+        // 25% -> breach -> no proof can be produced
+        let mut inp = input(flat());
+        inp.vault_state = Some(vs(1, 35, 1.0));
+        inp.settle = Some(holdings(0.05, 0.0)); // NAV 26/35 = 0.743
+        let out = run(&params(), &inp, [1u8; 32]);
+        assert!(out.risk_bundle.is_none());
+        assert_eq!(out.risk_basis, "positions");
     }
 
     #[test]

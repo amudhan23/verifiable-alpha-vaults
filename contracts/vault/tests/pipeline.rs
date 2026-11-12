@@ -54,6 +54,7 @@ fn market_input() -> RunInput {
         max_leverage_bps: 30_000,
         max_drawdown_bps: 2_000,
         settle: None,
+        vault_state: None,
     }
 }
 

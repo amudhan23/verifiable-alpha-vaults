@@ -76,3 +76,16 @@ What happens if the manager, executor, or OutLayer disappears. No admin key can 
 - **Recovery:** anyone can `deposit_recovered()` repatriated value; `claim_recovered()` pays each claimant pro rata, capped at their claim. No double-claiming (tested).
 - **MPC path rotation:** `propose_mpc_path` → 48h timelock → `apply_mpc_path` (callable by anyone). Depositors who object can exit first.
 - **Honest limit:** funds already on the EVM address can only move with NEAR's MPC network signing for the vault's path. The guarantee covers the NEAR side completely and makes the cross-chain side an enforceable, transparent claim. It cannot make the MPC network unnecessary.
+
+## Risk bound to real positions (12 Nov, live)
+
+Before: the enclave proved leverage/drawdown from numbers the executor handed it (including NAV and peak NAV) and from its own decision. A dishonest executor could flatter the proof.
+
+Now:
+- **The enclave computes risk from actual holdings.** Exposure = Sepolia ETH × oracle ÷ total NAV (vault pool + cross-chain value). Drawdown = current NAV/share vs. the **on-chain** high-water mark. The leverage bound is `max(actual exposure, what the new decision requests)`.
+- **The contract checks the inputs at commit.** The enclave input's `vault_state` (pool, shares, HWM, settled external value, guardrails) must equal the vault's live state, or the commitment is refused. Live red-team: an inflated pool was rejected in tx `2huuq9iv…` with *"enclave input vault_state.pool_yocto=… but the vault has …"*.
+- **Every input is now checkable:** vault state (by the contract), balances (against Sepolia at `evm_block`), prices (against public history, in-browser).
+- Settlement moved to the end of the cycle, so the state checked at commit can't move mid-cycle.
+- First live commitment on this basis: #12 (`basis: positions`).
+
+**Stated plainly:** when every position sits on a public chain, these metrics are recomputable by anyone, so the Bulletproof's *hiding* adds little; its value here is a uniform, verifiable bound. Hiding matters for positions that are **not** public: exchange accounts whose API keys live in the enclave (roadmap). There, the same proof shows limits held without revealing the book. Path risk *between* runs is still unobserved; run cadence bounds it.

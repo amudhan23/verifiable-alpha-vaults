@@ -139,9 +139,10 @@ export async function checkRiskProven(vault, onStep = () => {}) {
     if (res !== "ok") return { state: "bad", detail: `epoch ${p.epoch}: ${res}` };
     await new Promise((r) => setTimeout(r, 40));
   }
+  const onPositions = vault.commitments.filter((c) => c.input_json?.includes('"vault_state"')).length;
   return {
     state: "ok",
-    detail: `${vault.risk_proofs.length} Bulletproof bundles verified in this browser (leverage ≤ ${vault.guardrails.max_leverage_bps / 10000}x, drawdown ≤ ${vault.guardrails.max_drawdown_bps / 100}%)`,
+    detail: `${vault.risk_proofs.length} Bulletproof bundles verified in this browser (leverage ≤ ${vault.guardrails.max_leverage_bps / 10000}x, drawdown ≤ ${vault.guardrails.max_drawdown_bps / 100}%)${onPositions ? `; latest ${onPositions} computed from actual holdings, inputs checked by the contract` : ""}`,
   };
 }
 
