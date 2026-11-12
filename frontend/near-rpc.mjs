@@ -1,7 +1,7 @@
 // Live mode: read a deployed vault straight from NEAR JSON-RPC — no SDK, no
 // build step, no server. Open index.html?vault=<contract-id>[&rpc=<url>].
 
-const DEFAULT_RPC = "https://rpc.testnet.fastnear.com";
+const DEFAULT_RPC = "https://rpc.testnet.near.org";
 
 export class LiveVault {
   constructor(contractId, rpcUrl = DEFAULT_RPC) {

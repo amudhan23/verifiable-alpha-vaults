@@ -14,7 +14,7 @@ export class NearVault {
   constructor(cfg) {
     this.cfg = {
       networkId: "testnet",
-      nodeUrl: "https://rpc.testnet.fastnear.com",
+      nodeUrl: "https://rpc.testnet.near.org",
       ...cfg,
     };
     this._account = null;

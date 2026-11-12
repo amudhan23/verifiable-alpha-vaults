@@ -54,3 +54,10 @@ demo material.
   `sealed` field is publicly visible after the fact → acceptable for the demo
   since reveal follows seconds later, but note it in the README trust model;
   roadmap: encrypt `sealed` to the executor's key)
+
+## Note on the canonical wasm hash
+Local builds and CI builds of `strategy.wasm` produce different hashes
+(non-reproducible paths). The **canonical approved_wasm_hash is the hash of
+the binary OutLayer runs** — take it from the OutLayer project after
+deployment (or from `outlayer upload`'s output) and pass that to the vault's
+`new()`. The TDX attestation links source → that hash → every run.
