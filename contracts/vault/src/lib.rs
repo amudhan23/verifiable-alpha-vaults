@@ -1035,7 +1035,10 @@ impl Vault {
                 "project_id": format!("{}/alpha-vault-strategy", self.owner),
                 "version_key": self.approved_wasm_hash,
             }},
-            "resource_limits": {},
+            // Bulletproof generation needs ~2.3e9 instructions; OutLayer's
+            // default budget (1e9) aborts the run mid-proof.
+            "resource_limits": {"max_instructions": 5_000_000_000u64, "max_memory_mb": 256, "max_execution_seconds": 60},
+            "response_format": "Json",
             "input_data": input_json,
             "secrets_ref": { "profile": "default", "account_id": self.owner },
         });
@@ -1106,9 +1109,22 @@ impl Vault {
                 emit("attested_settlement_skipped", serde_json::json!({"id": id, "reason": e}));
             }
         }
-        if let Some(h) = out["bundle_sha256"].as_str().filter(|h| h.len() == 64) {
-            let epoch = serde_json::from_str::<serde_json::Value>(&input_json).ok().and_then(|v| v["epoch"].as_u64()).unwrap_or(0);
-            self.expected_bundles.insert(h.to_string(), epoch);
+        let epoch_in = serde_json::from_str::<serde_json::Value>(&input_json).ok().and_then(|v| v["epoch"].as_u64()).unwrap_or(0);
+        if out["risk_bundle"].is_object() {
+            // the enclave delivered the proofs themselves: anchor them directly
+            let bundle_json = out["risk_bundle"].to_string();
+            let lev = out["risk_bundle"]["leverage"]["limit"].as_u64().unwrap_or(0);
+            let dd = out["risk_bundle"]["drawdown"]["limit"].as_u64().unwrap_or(0);
+            if bundle_json.len() <= MAX_BUNDLE_JSON && lev == self.guardrails.max_leverage_bps && dd == self.guardrails.max_drawdown_bps {
+                self.risk_proofs.push(StoredRiskProof {
+                    epoch: epoch_in, max_leverage_bps: lev, max_drawdown_bps: dd, bundle_json, posted_at_ms: env::block_timestamp_ms(),
+                });
+                emit("risk_proof", serde_json::json!({"epoch": epoch_in, "path": "onchain"}));
+            } else {
+                emit("attested_bundle_skipped", serde_json::json!({"id": id, "reason": "limits differ from guardrails or bundle too large"}));
+            }
+        } else if let Some(h) = out["bundle_sha256"].as_str().filter(|h| h.len() == 64) {
+            self.expected_bundles.insert(h.to_string(), epoch_in);
         }
         if let Some(e) = out["risk_error"].as_str() {
             emit("risk_breach", serde_json::json!({"id": id, "reason": e.chars().take(200).collect::<String>()}));

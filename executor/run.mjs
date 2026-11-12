@@ -33,6 +33,10 @@ const need = (k) => {
 const APPROVED_WASM_HASH =
   process.env.APPROVED_WASM_HASH ?? "c3b8b92a101e575d1c0e2e502c1fc21443fa0e08e864e84fe467d5840bda9f77";
 
+// --enclave onchain: the VAULT requests the run from OutLayer on-chain
+// (request_execution, resolved only by DCAP-verified TDX workers); the output
+// lands in the vault's own callback, never passing through this process.
+const onchainEnclave = arg("enclave", "local") === "onchain";
 const live = arg("enclave", "local") === "outlayer";
 const enclave = live
   ? new OutLayerEnclave({
@@ -65,7 +69,7 @@ async function unseal(output) {
 
 async function cycle() {
   const epoch = Number(arg("epoch", `${Math.floor(Date.now() / 3_600_000)}`));
-  const market = flag("fixed") || !live ? fixedMarket() : await fetchMarket();
+  const market = flag("fixed") || !(live || onchainEnclave) ? fixedMarket() : await fetchMarket();
   console.log(`→ oracle: ${market.oracle.spot_source} · ETH $${market.oracle.eth_usd} · NEAR $${market.oracle.near_usd}`);
 
   let settle = null;
@@ -101,6 +105,7 @@ async function cycle() {
     } } : {}),
   };
 
+  if (onchainEnclave) return onchainCycle({ input, epoch, market });
   if (summary?.approved_wasm_hash && "versionKey" in enclave) enclave.versionKey = summary.approved_wasm_hash;
   console.log(`→ enclave run (epoch ${epoch})`);
   const { output, attestationRef, callId, timeMs, executedWasm } = await enclave.run(input);
@@ -169,6 +174,47 @@ async function cycle() {
   }
   const after = onChain ? await vault.view("get_summary") : await vault.view();
   console.log("\ncycle complete:", JSON.stringify({ commitments: after.commitments, risk_proofs: after.risk_proofs, nav_yocto: after.nav_yocto }, null, 0));
+}
+
+async function onchainCycle({ input, epoch, market }) {
+  console.log(`→ vault.request_decision (epoch ${epoch}): OutLayer runs the approved build in TDX and calls the vault back`);
+  const t0 = Date.now();
+  const res = await vault.callRaw("request_decision", { input_json: JSON.stringify(input) },
+    300_000_000_000_000n, (100_000_000_000_000_000_000_000n + 7_500_000_000_000_000_000_000n).toString()); // 0.1 storage reserve + OutLayer fee
+  const logs = res.receipts_outcome.flatMap((o) => o.outcome.logs);
+  const ev = (name) => logs.filter((l) => l.includes(`"event":"${name}"`)).map((l) => JSON.parse(l.slice(11)).data[0]);
+  const failed = ev("decision_request_failed")[0];
+  const commit = ev("commit")[0];
+  console.log(`  tx ${res.transaction.hash} · ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  if (failed || !commit) {
+    for (const l of logs) if (/Execution failed|decision_request_failed/.test(l)) console.log("  " + l.slice(0, 300));
+    throw new Error("on-chain request did not deliver a decision");
+  }
+  const id = commit.id;
+  console.log(`  committed as #${id} by the vault's own callback (attested path)`);
+  if (ev("risk_proof").length) console.log("  Bulletproof bundle anchored from the enclave's delivery");
+  for (const e of ev("attested_settlement_skipped")) console.log(`  settlement skipped: ${e.reason}`);
+  if (ev("settlement").length) console.log("  settlement applied from the enclave's delivery");
+  let c = await vault.view("get_commitment", { id });
+  if (c.status === "Committed") {
+    // the decision is sealed to the relayer's key; its hash is already fixed
+    // on-chain, so revealing is all the relayer can do with it
+    const sealed = await unseal({ sealed_enc: c.sealed_enc });
+    console.log("→ reveal (hash fixed by the enclave's on-chain commitment)");
+    await vault.executeDecision(id, sealed.decision_json, sealed.salt_hex);
+    c = await vault.view("get_commitment", { id });
+  }
+  const decision = JSON.parse(c.revealed);
+  if (c.status !== "Executed") console.log(`  decision ${c.status}: nothing will be signed`);
+  else if (evm && decision.action !== "hold") {
+    console.log(`→ execute ${decision.action} ${decision.amount_in}: the vault signs each leg via MPC`);
+    const r = await evm.executeTrade({ id, commitment: c.commitment, decision, ethUsd: market.oracle.eth_usd });
+    for (const t of r.txs) console.log(`  ${t.step}: ${t.status} ${t.hash}`);
+    console.log(`  ${r.detail}`);
+    if (r.ref) await vault.recordExecutionRef(id, r.ref);
+  } else console.log(`→ ${decision.action}`);
+  const after = await vault.view("get_summary");
+  console.log("\ncycle complete:", JSON.stringify({ mode: after.mode, commitments: after.commitments, risk_proofs: after.risk_proofs, nav_yocto: after.nav_yocto }));
 }
 
 const everyMin = Number(arg("every", "0"));

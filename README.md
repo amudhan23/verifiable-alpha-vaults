@@ -26,7 +26,7 @@ Two independent reviews attacked the vault. The first found **3 Critical issues 
   - Withdrawals pay an exact pool slice.
   - The vault's EVM wallet can never change.
   - The relayer pays for every byte it writes.
-- **Attested** (built, switches on when OutLayer's on-chain worker resumes calls): only TDX-attested output delivered on-chain can commit, trade, settle or prove. Switching it on is immediate; switching back takes 48h.
+- **Attested** (working on testnet; switched on once strategy v2 is applied Sat 14 Nov): only TDX-attested output delivered on-chain can commit, trade, settle or prove. The vault calls OutLayer's `request_execution` itself, and only DCAP-verified workers can answer. Commitment #18 was created by the vault's own callback this way, with its Bulletproofs anchored from the enclave's delivery. Switching it on is immediate; switching back takes 48h.
 
 Every finding, fix and regression test, plus the residual risks, is in [`docs/SECURITY.md`](docs/SECURITY.md).
 
@@ -157,8 +157,8 @@ set up your own: `scripts/outlayer-setup.md`, then `node executor/deploy.mjs`.
   time, and the cross-chain valuation drawn on the chart. Its attestations are
   checkable off-chain by anyone (the four seals). **Attested mode** removes the
   relayer from both: only OutLayer's on-chain `request_execution`, which only
-  DCAP-verified TDX workers can resolve, can act. It's built and tested, but
-  OutLayer's testnet worker doesn't resume on-chain calls yet. The market
+  DCAP-verified TDX workers can resolve, can act. It works on testnet
+  (`node executor/run.mjs --enclave onchain --vault near`). The market
   inputs are still supplied by the requester in either mode; the browser's
   price check compares them against public history.
 - **Exit guarantees:** if no attested decision lands for 24h, anyone can

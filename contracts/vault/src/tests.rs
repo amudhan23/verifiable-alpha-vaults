@@ -425,6 +425,31 @@ fn with_input(ts_ms: u64, input: Vec<u8>) {
 }
 
 #[test]
+fn attested_full_output_anchors_proofs_and_relayer_can_only_reveal_what_was_committed() {
+    let mut v = new_vault();
+    at(alice(), 10 * NEAR, 1_000);
+    v.deposit();
+    ctx(owner(), 0);
+    v.enable_attested();
+    let d = decision("buy", 25_000, 4_000, "ETH/USDC");
+    let salt = [3u8; 32];
+    let mut si: serde_json::Value = serde_json::from_str(&state_input(&v)).unwrap();
+    si["epoch"] = serde_json::json!(8);
+    let out = serde_json::json!({
+        "commitment": commit_of(&d, &salt),
+        "sealed_enc": "00ff",
+        "risk_bundle": {"leverage": {"limit": 30000, "proof": "aa"}, "drawdown": {"limit": 2000, "proof": "bb"}},
+    });
+    let id = deliver(&mut v, out, si.to_string(), 2_000).unwrap();
+    assert_eq!(v.get_summary()["risk_proofs"], 1, "proofs anchored straight from the enclave's delivery");
+    assert_eq!(v.get_commitment(id).unwrap().status, CommitmentStatus::Committed);
+    ctx(executor(), NEAR / 10);
+    assert!(panics(|| v.execute_decision(id, decision("sell", 25_000, 4_000, "ETH/USDC"), hex::encode(salt))), "can't swap the decision");
+    v.execute_decision(id, d, hex::encode(salt));
+    assert_eq!(v.get_commitment(id).unwrap().status, CommitmentStatus::Executed);
+}
+
+#[test]
 fn code_upgrade_is_timelocked_and_hash_bound() {
     let mut v = new_vault();
     at(owner(), 0, 0);
