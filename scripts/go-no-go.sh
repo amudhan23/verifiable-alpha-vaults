@@ -65,7 +65,7 @@ echo "$OUTPUT" | jq '{commitment: .commitment, decision: (.sealed.decision_json 
 # local re-check: sha256(decision_json || salt) == commitment
 DEC=$(echo "$OUTPUT" | jq -r .sealed.decision_json)
 SALT=$(echo "$OUTPUT" | jq -r .sealed.salt_hex)
-RECOMPUTED=$( { printf '%s' "$DEC"; echo "$SALT" | xxd -r -p; } | sha256sum | cut -d' ' -f1 )
+RECOMPUTED=$(python3 -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()+bytes.fromhex(sys.argv[2])).hexdigest())" "$DEC" "$SALT")
 CLAIMED=$(echo "$OUTPUT" | jq -r .commitment)
 [[ "$RECOMPUTED" == "$CLAIMED" ]] \
   && echo "✓ commitment recomputes locally" \

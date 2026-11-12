@@ -125,5 +125,8 @@ if (output.risk_bundle) {
   console.log("  posted ✓");
 }
 
-console.log("\ncycle complete:", JSON.stringify(await vault.view(), null, 2));
+const summary = vault instanceof (await import("./vault.mjs")).NearVault
+  ? await vault.view("get_summary")
+  : await vault.view();
+console.log("\ncycle complete:", JSON.stringify(summary, null, 2));
 }

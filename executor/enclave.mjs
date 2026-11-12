@@ -37,7 +37,7 @@ export class OutLayerEnclave {
       throw new Error(`OutLayer call ${body.call_id ?? "?"} ${body.status}: ${body.error ?? res.status}`);
     }
     return {
-      output: JSON.parse(body.output),
+      output: typeof body.output === "string" ? JSON.parse(body.output) : body.output,
       attestationRef: `${this.base}${body.attestation_url}`,
       callId: body.call_id,
       timeMs: body.time_ms,

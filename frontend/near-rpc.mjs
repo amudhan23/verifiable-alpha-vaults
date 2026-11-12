@@ -48,7 +48,7 @@ export class LiveVault {
         : null;
     return {
       id: this.contractId,
-      name: this.contractId.split(".")[0],
+      name: this.contractId,
       manager: s.owner,
       live: true,
       approved_wasm_hash: s.approved_wasm_hash,
