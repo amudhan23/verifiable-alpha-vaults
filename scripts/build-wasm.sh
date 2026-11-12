@@ -10,8 +10,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "== 1/3 vault contract =="
-RUSTFLAGS="--cfg near" cargo build -p vault-contract --target wasm32-unknown-unknown --release
+# -s drops the ~350 KB name section (code storage is staked NEAR: 1 NEAR / 100 KB)
+RUSTFLAGS="--cfg near -C link-arg=-s" cargo build -p vault-contract --target wasm32-unknown-unknown --release
 CONTRACT=target/wasm32-unknown-unknown/release/vault_contract.wasm
+if command -v wasm-opt >/dev/null; then
+  wasm-opt -Oz --strip-debug --strip-producers --enable-bulk-memory --enable-bulk-memory-opt --enable-sign-ext --enable-mutable-globals --enable-nontrapping-float-to-int -o "$CONTRACT.opt" "$CONTRACT" && mv "$CONTRACT.opt" "$CONTRACT"
+fi
 ls -la "$CONTRACT"
 
 echo "== 2/3 strategy (OutLayer enclave binary) =="

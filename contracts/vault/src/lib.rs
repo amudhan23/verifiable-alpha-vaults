@@ -1,4 +1,23 @@
-//! # Verifiable Alpha Vault (v4)
+//! # Verifiable Alpha Vault (v5)
+//!
+//! v5 (after a second independent review) makes the trust model explicit with
+//! two modes:
+//!
+//! * **Relayed** (default, live today): a named executor relays enclave output.
+//!   It is openly trusted for *liveness and valuation reports*, and every
+//!   mechanical lever it used to have is removed: trade sizes and slippage
+//!   floors come from the sealed strategy's committed decision, deposits only
+//!   open while the vault is fully in NEAR (so a valuation can never misprice
+//!   a deposit), fees only crystallize on realized (repatriated) gains, the
+//!   cross-chain wallet can never be rotated, and the executor pays for every
+//!   byte it writes.
+//! * **Attested**: only output delivered by OutLayer's on-chain
+//!   `request_execution` (resolved exclusively by DCAP-verified TDX workers)
+//!   can commit, execute, settle or prove risk. Switching on is immediate;
+//!   switching back is timelocked 48h.
+//!
+//! Code upgrades go through the same 48h timelock (`propose_code` /
+//! `apply_code`) once the account's full-access key is deleted.
 //!
 //! A trading vault whose strategy **parameters stay sealed in a TEE** while
 //! everything an investor needs to check is enforced or logged on-chain.
@@ -42,7 +61,7 @@ use near_sdk::{
 };
 
 const EVENT_STANDARD: &str = "alpha-vault";
-const EVENT_VERSION: &str = "4.0.0";
+const EVENT_VERSION: &str = "5.0.0";
 /// Scale for NAV-per-share fixed-point math.
 const NPS_SCALE: u128 = 1_000_000_000_000;
 /// Scale for the per-external-unit payout accumulator.
@@ -59,8 +78,11 @@ pub const ROTATION_DELAY_MS: u64 = 48 * 3_600_000;
 /// Settlement bounds: max NAV move per settlement, min spacing.
 pub const MAX_SETTLE_STEP_BPS: u128 = 1_000;
 pub const MIN_SETTLE_INTERVAL_MS: u64 = 3_600_000;
-/// Fees crystallize only on a valuation that has stood this long.
-pub const FEE_SETTLEMENT_AGE_MS: u64 = 24 * 3_600_000;
+/// NEAR an attested `request_decision` keeps back to pay for the storage its
+/// callback writes (the rest goes to OutLayer).
+pub const ATTESTED_STORAGE_RESERVE: u128 = ONE_NEAR / 10;
+/// A swap's deadline must fall within this window from now.
+pub const MAX_DEADLINE_S: u64 = 3_600;
 const NAV_LOG_CAP: u32 = 2_000;
 /// Fixed unit count created with the first external value (1e24): with
 /// ACC_SCALE 1e24, repatriations up to ~1e14 NEAR stay inside u128.
@@ -79,8 +101,12 @@ pub const MPC_SIGNER: &str = "v1.signer-prod.testnet";
 const WETH: [u8; 20] = hex20("fff9976782d46cc05630d1f6ebab18b2324d6b14");
 const USDC: [u8; 20] = hex20("1c7d4b196cb0c7b01d743fbc6116a902379c7238");
 const ROUTER: [u8; 20] = hex20("3bfa4769fb09eefc5a80d6e87c3b9c650f7ae48e");
-const MAX_FEE_PER_GAS: u128 = 300_000_000_000; // 300 gwei
-const MAX_GAS_LIMIT: u64 = 400_000;
+const MAX_FEE_PER_GAS: u128 = 100_000_000_000; // 100 gwei
+/// Per-leg gas caps (gas is paid from the vault's own ETH).
+const GAS_CAP_WRAP: u64 = 200_000;
+const GAS_CAP_APPROVE: u64 = 120_000;
+const GAS_CAP_SWAP: u64 = 400_000;
+const MAX_GAS_LIMIT: u64 = GAS_CAP_SWAP;
 
 const fn hex20(s: &str) -> [u8; 20] {
     let b = s.as_bytes();
@@ -195,6 +221,37 @@ pub mod evm {
     pub fn word_max() -> Vec<u8> {
         vec![0xff; 32]
     }
+    fn hexb(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+    /// SwapRouter02 `multicall(uint256 deadline, bytes[] data)` wrapping one
+    /// `exactInputSingle`, with the 32-byte decision commitment appended to
+    /// the inner call (ignored by the router, ties the trade to the commit).
+    #[allow(clippy::too_many_arguments)]
+    pub fn swap_calldata(
+        token_in: &[u8; 20], token_out: &[u8; 20], fee: u32, recipient: &[u8; 20],
+        amount_in: u128, min_out: u128, deadline_s: u64, commitment_hex: &str,
+    ) -> Vec<u8> {
+        let mut inner = hexb("04e45aaf");
+        inner.extend(word_addr(token_in));
+        inner.extend(word_addr(token_out));
+        inner.extend(word_u128(fee as u128));
+        inner.extend(word_addr(recipient));
+        inner.extend(word_u128(amount_in));
+        inner.extend(word_u128(min_out));
+        inner.extend(word_u128(0)); // sqrtPriceLimitX96
+        inner.extend(hexb(commitment_hex));
+        let mut out = hexb("5ae401dc");
+        out.extend(word_u128(deadline_s as u128));
+        out.extend(word_u128(0x40)); // offset of bytes[]
+        out.extend(word_u128(1)); // array length
+        out.extend(word_u128(0x20)); // offset of element 0
+        out.extend(word_u128(inner.len() as u128));
+        let pad = (32 - inner.len() % 32) % 32;
+        out.extend(inner);
+        out.extend(vec![0u8; pad]);
+        out
+    }
 }
 
 #[derive(BorshStorageKey)]
@@ -216,6 +273,8 @@ enum StorageKey {
     ExtPending,
     SignedLegs,
     FailedPayouts,
+    AttestedIds,
+    ExpectedBundles,
 }
 
 pub const STRATEGY_TOKEN_ID: &str = "strategy-1";
@@ -238,6 +297,38 @@ pub struct Decision {
     pub leverage_bps: u64,
     pub epoch: u64,
     pub nonce: u64,
+    /// Trade size decided inside the enclave (sell: wei of ETH, buy: USDC
+    /// 6dp), the slippage floor in the output token, and the pool fee tier.
+    /// The vault signs exactly these; nobody else chooses them.
+    #[serde(default)]
+    pub amount_in: String,
+    #[serde(default)]
+    pub min_out: String,
+    #[serde(default)]
+    pub fee_tier: u32,
+}
+
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// A named executor relays enclave output (openly trusted for liveness
+    /// and valuation reports; mechanically constrained everywhere else).
+    Relayed,
+    /// Only OutLayer's on-chain, TDX-attested delivery can commit, execute,
+    /// settle or prove.
+    Attested,
+}
+
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug)]
+pub struct Proposal {
+    /// strategy: wasm sha256; code: contract sha256; mode: "relayed"
+    pub hash: String,
+    pub url: String,
+    pub effective_at_ms: u64,
+    /// Bound to whoever proposed it: if the strategy NFT changes hands, a
+    /// pending proposal can no longer be applied.
+    pub proposer: AccountId,
 }
 
 #[near(serializers = [borsh, json])]
@@ -327,10 +418,17 @@ pub struct Vault {
     /// The EVM address MPC derives for (this contract, mpc_path). Every swap's
     /// recipient is locked to it.
     pub evm_address: String,
-    pub pending_wallet: Option<(String, String, u64)>,
-    pub pending_strategy: Option<(String, String, u64)>,
+    pub pending_strategy: Option<Proposal>,
     signed_legs: LookupMap<String, bool>,
     failed_payouts: LookupMap<AccountId, u128>,
+    // ---- v5 ----
+    pub mode: Mode,
+    pub pending_relayed: Option<Proposal>,
+    pub pending_code: Option<Proposal>,
+    /// Commitments delivered by the attested on-chain path.
+    attested_ids: LookupMap<u64, bool>,
+    /// sha256 of risk bundles the enclave produced (attested) -> epoch.
+    expected_bundles: LookupMap<String, u64>,
 }
 
 fn emit(event: &str, data: serde_json::Value) {
@@ -387,7 +485,7 @@ impl Vault {
             Some(TokenMetadata {
                 title: Some("Alpha Vault Strategy #1".into()),
                 description: Some(format!(
-                    "Sealed-parameter strategy attested as wasm {}. Holder earns performance fees and controls the (timelocked) strategy and wallet rotations.",
+                    "Sealed-parameter strategy attested as wasm {}. Holder earns performance fees on realized gains and controls the (timelocked) strategy, mode and code changes.",
                     approved_wasm_hash
                 )),
                 media: None, media_hash: None, copies: Some(1), issued_at: None,
@@ -439,10 +537,14 @@ impl Vault {
             ext_paid_total: 0,
             mpc_path,
             evm_address,
-            pending_wallet: None,
             pending_strategy: None,
             signed_legs: LookupMap::new(StorageKey::SignedLegs),
             failed_payouts: LookupMap::new(StorageKey::FailedPayouts),
+            mode: Mode::Relayed,
+            pending_relayed: None,
+            pending_code: None,
+            attested_ids: LookupMap::new(StorageKey::AttestedIds),
+            expected_bundles: LookupMap::new(StorageKey::ExpectedBundles),
         }
     }
 
@@ -457,6 +559,12 @@ impl Vault {
         require!(!self.deposits_paused, "deposits are paused (integrity alert)");
         let amount = env::attached_deposit().as_yoctonear();
         require!(amount >= MIN_DEPOSIT, "minimum deposit is 0.1 NEAR");
+        // A cross-chain valuation can never price a deposit: new money only
+        // comes in while every yocto of NAV is NEAR held by this contract.
+        require!(
+            self.ext_value == 0,
+            "deposits open only while the vault is fully in NEAR: cross-chain value must be repatriated first"
+        );
         self.crystallize_fees();
         let nav = self.nav();
         let minted = match (self.total_shares, nav) {
@@ -621,6 +729,8 @@ impl Vault {
         input_json: String,
     ) -> u64 {
         self.assert_executor();
+        self.assert_relayed();
+        let before = env::storage_usage();
         require!(!self.emergency, "vault is in emergency exit mode");
         require!(commitment.len() == 64 && hex::decode(&commitment).is_ok(), "commitment must be 32 bytes hex");
         require!(attestation_ref.len() <= MAX_REF, "attestation_ref too long");
@@ -655,26 +765,38 @@ impl Vault {
             self.last_attested_ms = env::block_timestamp_ms();
             emit("commit", serde_json::json!({"id": id, "commitment": commitment}));
         }
+        self.charge_storage(before);
         id
     }
 
+    /// Reveal a committed decision. The preimage must hash to the stored
+    /// commitment, so whoever submits it cannot change it. In attested mode it
+    /// only applies to commitments the enclave delivered on-chain.
+    #[payable]
     pub fn execute_decision(&mut self, id: u64, decision_json: String, salt_hex: String) {
         self.assert_executor();
-        require!(decision_json.len() <= MAX_DECISION_JSON, "decision too long");
-        require!(salt_hex.len() <= 128, "salt too long");
-        let c = self
-            .commitments
-            .get(id as u32)
-            .unwrap_or_else(|| env::panic_str("no such commitment: trade was never committed"))
-            .clone();
-        require!(c.status == CommitmentStatus::Committed, "commitment already settled");
-        let salt = hex::decode(&salt_hex).unwrap_or_else(|_| env::panic_str("salt must be hex"));
+        if self.mode == Mode::Attested {
+            require!(self.attested_ids.get(&id).is_some(), "attested mode: only enclave-delivered commitments can be revealed");
+        }
+        let before = env::storage_usage();
+        if let Err(e) = self.reveal(id, decision_json, salt_hex) {
+            env::panic_str(&e);
+        }
+        self.charge_storage(before);
+    }
+
+    fn reveal(&mut self, id: u64, decision_json: String, salt_hex: String) -> Result<(), String> {
+        if decision_json.len() > MAX_DECISION_JSON { return Err("decision too long".into()); }
+        if salt_hex.len() > 128 { return Err("salt too long".into()); }
+        let c = self.commitments.get(id as u32).ok_or("no such commitment: trade was never committed")?.clone();
+        if c.status != CommitmentStatus::Committed { return Err("commitment already settled".into()); }
+        let salt = hex::decode(&salt_hex).map_err(|_| "salt must be hex")?;
         let mut preimage = decision_json.as_bytes().to_vec();
         preimage.extend_from_slice(&salt);
         if hex::encode(env::sha256(&preimage)) != c.commitment {
-            env::panic_str("reveal does not match commitment: this trade was not committed when claimed");
+            return Err("reveal does not match commitment: this trade was not committed when claimed".into());
         }
-        let d: Decision = serde_json::from_str(&decision_json).unwrap_or_else(|_| env::panic_str("decision is not valid JSON"));
+        let d: Decision = serde_json::from_str(&decision_json).map_err(|_| "decision is not valid JSON")?;
         let entry = self.commitments.get_mut(id as u32).unwrap();
         entry.revealed = Some(decision_json.clone());
         entry.salt_hex = Some(salt_hex);
@@ -690,13 +812,17 @@ impl Vault {
                 emit("executed", serde_json::json!({"id": id, "decision": decision_json}));
             }
         }
+        Ok(())
     }
 
     /// The vault builds the EVM transaction for one leg of an executed
-    /// decision and asks the MPC network to sign it. Recipient is locked to
-    /// the vault's own address; targets are only WETH / USDC (approve) / the
-    /// Uniswap router; gas is capped; each leg can be signed once per
-    /// decision. The executor merely broadcasts the result.
+    /// decision and asks the MPC network to sign it. Amount, slippage floor
+    /// and fee tier come from the committed decision itself (decided in the
+    /// enclave); the recipient is the vault's own address; targets are only
+    /// WETH / USDC (approve) / the Uniswap router; gas is capped per leg; the
+    /// swap carries a deadline; each leg is signed at most once per decision.
+    /// The caller only picks the EVM nonce and gas price (capped) and
+    /// broadcasts the result.
     #[payable]
     pub fn sign_evm_tx(
         &mut self,
@@ -706,51 +832,49 @@ impl Vault {
         max_fee_per_gas: U128,
         max_priority_fee_per_gas: U128,
         gas_limit: u64,
-        amount_in: U128,
-        amount_out_min: U128,
-        fee_tier: u32,
+        deadline_s: u64,
     ) -> Promise {
         self.assert_executor();
         require!(!self.emergency, "vault is in emergency exit mode");
+        if self.mode == Mode::Attested {
+            require!(self.attested_ids.get(&id).is_some(), "attested mode: only enclave-delivered decisions can trade");
+        }
+        let before = env::storage_usage();
         let c = self.commitments.get(id as u32).unwrap_or_else(|| env::panic_str("no such commitment")).clone();
         require!(c.status == CommitmentStatus::Executed, "decision not executed (or rejected by guardrails)");
         let d: Decision = serde_json::from_str(c.revealed.as_deref().unwrap_or("")).unwrap_or_else(|_| env::panic_str("no revealed decision"));
         require!(d.pair == "ETH/USDC", "only ETH/USDC is wired for execution");
         require!(d.action == "buy" || d.action == "sell", "nothing to execute for this decision");
+        let amount_in: u128 = d.amount_in.parse().unwrap_or(0);
+        let min_out: u128 = d.min_out.parse().unwrap_or(0);
+        require!(amount_in > 0, "decision carries no trade size (pre-v2 strategy): nothing the vault can sign");
+        require!(min_out > 0, "decision carries no slippage floor");
+        require!(matches!(d.fee_tier, 500 | 3000 | 10000), "decision has an unknown fee tier");
         require!(max_fee_per_gas.0 <= MAX_FEE_PER_GAS, "max_fee_per_gas above cap");
         require!(max_priority_fee_per_gas.0 <= max_fee_per_gas.0, "priority fee above max fee");
-        require!(gas_limit <= MAX_GAS_LIMIT, "gas_limit above cap");
         let key = format!("{id}:{leg}");
         require!(self.signed_legs.get(&key).is_none(), "this leg was already signed for this decision");
         let me = parse_evm_address(&self.evm_address);
         let (token_in, token_out) = if d.action == "sell" { (WETH, USDC) } else { (USDC, WETH) };
-        let (to, value, data) = match leg.as_str() {
+        let (to, value, data, cap) = match leg.as_str() {
             "wrap" => {
                 require!(d.action == "sell", "wrap is only needed to sell ETH");
-                (WETH, amount_in.0, hex::decode("d0e30db0").unwrap())
+                (WETH, amount_in, hex::decode("d0e30db0").unwrap(), GAS_CAP_WRAP)
             }
             "approve" => {
                 let mut data = hex::decode("095ea7b3").unwrap();
                 data.extend(evm::word_addr(&ROUTER));
                 data.extend(evm::word_max());
-                (token_in, 0, data)
+                (token_in, 0, data, GAS_CAP_APPROVE)
             }
             "swap" => {
-                require!(matches!(fee_tier, 500 | 3000 | 10000), "unknown fee tier");
-                require!(amount_out_min.0 > 0, "amount_out_min must be set (slippage guard)");
-                let mut data = hex::decode("04e45aaf").unwrap();
-                data.extend(evm::word_addr(&token_in));
-                data.extend(evm::word_addr(&token_out));
-                data.extend(evm::word_u128(fee_tier as u128));
-                data.extend(evm::word_addr(&me)); // recipient: the vault itself
-                data.extend(evm::word_u128(amount_in.0));
-                data.extend(evm::word_u128(amount_out_min.0));
-                data.extend(evm::word_u128(0)); // sqrtPriceLimitX96
-                data.extend(hex::decode(&c.commitment).unwrap()); // tie trade to commitment
-                (ROUTER, 0, data)
+                let now_s = env::block_timestamp_ms() / 1_000;
+                require!(deadline_s > now_s && deadline_s <= now_s + MAX_DEADLINE_S, "deadline must be within the next hour");
+                (ROUTER, 0, evm::swap_calldata(&token_in, &token_out, d.fee_tier, &me, amount_in, min_out, deadline_s, &c.commitment), GAS_CAP_SWAP)
             }
             _ => env::panic_str("leg must be wrap | approve | swap"),
         };
+        require!(gas_limit <= cap, "gas_limit above this leg's cap");
         let tx = evm::Tx1559 {
             chain_id: EVM_CHAIN_ID,
             nonce,
@@ -765,11 +889,16 @@ impl Vault {
         let payload_hex = hex::encode(&payload);
         self.signed_legs.insert(key.clone(), true);
         emit("evm_sign_requested", serde_json::json!({"id": id, "leg": leg, "nonce": nonce, "payload": payload_hex}));
+        // storage for the leg record comes out of the attached deposit; the
+        // rest pays the MPC signer
+        let storage = self.storage_cost(before);
+        let att = env::attached_deposit().as_yoctonear();
+        require!(att > storage, "attach enough for storage plus the MPC signing fee");
         let args = serde_json::json!({"request": {
             "payload_v2": {"Ecdsa": payload_hex}, "path": self.mpc_path, "domain_id": 0,
         }});
         Promise::new(MPC_SIGNER.parse().unwrap())
-            .function_call("sign".to_string(), args.to_string().into_bytes(), env::attached_deposit(), Gas::from_tgas(200))
+            .function_call("sign".to_string(), args.to_string().into_bytes(), NearToken::from_yoctonear(att - storage), Gas::from_tgas(200))
             .then(Self::ext(env::current_account_id()).with_static_gas(Gas::from_tgas(15)).on_signed(key, payload_hex))
     }
 
@@ -789,37 +918,50 @@ impl Vault {
         }
     }
 
+    #[payable]
     pub fn record_execution_ref(&mut self, id: u64, execution_ref: String) {
         self.assert_executor();
+        let before = env::storage_usage();
         require!(execution_ref.len() <= MAX_REF, "execution_ref too long");
         let entry = self.commitments.get_mut(id as u32).unwrap_or_else(|| env::panic_str("no such commitment"));
         require!(entry.status == CommitmentStatus::Executed, "commitment not executed");
+        require!(entry.execution_ref.is_none(), "execution already recorded");
         entry.execution_ref = Some(execution_ref);
+        self.charge_storage(before);
     }
 
-    /// Settle the cross-chain wallet's value (computed in the enclave from
-    /// attested, published inputs). Bounded: NAV may move at most 10% per
-    /// settlement, settlements are >= 1h apart. Withdrawals never read this
-    /// number, so a misreport cannot extract NEAR; it can only skew deposit
-    /// pricing within the bound, and it is publicly fraud-provable.
+    /// Settle the cross-chain wallet's value (relayed mode: the executor's
+    /// report of an enclave valuation). Bounded: NAV moves at most 10% per
+    /// settlement, settlements are >= 1h apart. No withdrawal, deposit or fee
+    /// reads this number (deposits need it at 0, fees need it at 0), so a
+    /// misreport cannot move NEAR; it only shows on the NAV chart, publicly
+    /// checkable against the EVM block it names.
+    #[payable]
     pub fn settle_pnl(&mut self, ext_value: U128, evm_block: u64, attestation_ref: String) {
         self.assert_executor();
-        require!(!self.emergency, "vault is in emergency exit mode");
-        require!(attestation_ref.len() <= MAX_REF, "attestation_ref too long");
+        self.assert_relayed();
+        let before = env::storage_usage();
+        if let Err(e) = self.apply_settlement(ext_value.0, evm_block, attestation_ref) {
+            env::panic_str(&e);
+        }
+        self.charge_storage(before);
+    }
+
+    fn apply_settlement(&mut self, ext_value: u128, evm_block: u64, attestation_ref: String) -> Result<(), String> {
+        if self.emergency { return Err("vault is in emergency exit mode".into()); }
+        if attestation_ref.len() > MAX_REF { return Err("attestation_ref too long".into()); }
         let now = env::block_timestamp_ms();
-        require!(
-            self.last_settlement_ms == 0 || now >= self.last_settlement_ms + MIN_SETTLE_INTERVAL_MS,
-            "settlements must be at least 1h apart"
-        );
+        if self.last_settlement_ms != 0 && now < self.last_settlement_ms + MIN_SETTLE_INTERVAL_MS {
+            return Err("settlements must be at least 1h apart".into());
+        }
         let old_nav = self.nav();
         let old = self.ext_value;
         // units come into existence only with real value, at a fixed large
         // base (keeps the per-unit payout accumulator far from overflow)
-        let first = self.ext_units_total == 0 && ext_value.0 > 0;
-        if first {
-            require!(self.total_shares > 0, "no shareholders to own external value");
+        let first = self.ext_units_total == 0 && ext_value > 0;
+        if first && self.total_shares == 0 {
+            return Err("no shareholders to own external value".into());
         }
-        // validate before writing anything
         let (units_total, vault_units) = if first {
             (EXT_UNITS_BASE, EXT_UNITS_BASE)
         } else if self.ext_units_total == 0 {
@@ -827,31 +969,40 @@ impl Vault {
         } else {
             (self.ext_units_total, self.vault_ext_units)
         };
-        let new_holders = mul_div(ext_value.0, vault_units, units_total);
+        let new_holders = mul_div(ext_value, vault_units, units_total);
         let new_nav = self.pool + new_holders;
         let max_step = mul_div(old_nav, MAX_SETTLE_STEP_BPS, 10_000);
-        require!(
-            new_nav.abs_diff(old_nav) <= max_step,
-            "settlement moves NAV by more than 10%: split it across settlements"
-        );
+        if new_nav.abs_diff(old_nav) > max_step {
+            return Err("settlement moves NAV by more than 10%: split it across settlements".into());
+        }
         if first {
-            // first external value ever: units owned by shareholders. No shares
-            // are minted (the v3 seed-capital mint was an exploit).
             self.ext_units_total = units_total;
             self.vault_ext_units = vault_units;
         }
-        self.ext_value = ext_value.0;
+        self.ext_value = ext_value;
         self.last_settlement_ms = now;
         self.last_settlement_ref = Some(format!("evm block {} · {}", evm_block, attestation_ref));
         self.record_nav();
         emit("settlement", serde_json::json!({
-            "old_ext": old.to_string(), "new_ext": ext_value.0.to_string(),
+            "old_ext": old.to_string(), "new_ext": ext_value.to_string(),
             "evm_block": evm_block, "attestation_ref": attestation_ref,
         }));
+        Ok(())
     }
 
+    /// Relayed: the executor posts the enclave's bundle. Attested: anyone may
+    /// post it, but only a bundle whose sha256 the enclave itself delivered
+    /// on-chain for that epoch. Proofs are verified client-side either way.
+    #[payable]
     pub fn post_risk_proof(&mut self, epoch: u64, bundle_json: String) {
-        self.assert_executor();
+        if self.mode == Mode::Attested {
+            let h = hex::encode(env::sha256(bundle_json.as_bytes()));
+            require!(self.expected_bundles.get(&h) == Some(&epoch), "attested mode: bundle hash was not delivered by the enclave for this epoch");
+            self.expected_bundles.remove(&h);
+        } else {
+            self.assert_executor();
+        }
+        let before = env::storage_usage();
         require!(bundle_json.len() <= MAX_BUNDLE_JSON, "bundle too large");
         let v: serde_json::Value = serde_json::from_str(&bundle_json).unwrap_or_else(|_| env::panic_str("bundle is not valid JSON"));
         let lev = v["leverage"]["limit"].as_u64().unwrap_or(0);
@@ -861,6 +1012,7 @@ impl Vault {
             epoch, max_leverage_bps: lev, max_drawdown_bps: dd, bundle_json, posted_at_ms: env::block_timestamp_ms(),
         });
         emit("risk_proof", serde_json::json!({"epoch": epoch}));
+        self.charge_storage(before);
     }
 
     /// On-chain request to OutLayer (attested by construction: only
@@ -875,6 +1027,8 @@ impl Vault {
         if let Err(e) = self.check_input_state(&input_json) {
             env::panic_str(&e);
         }
+        let att = env::attached_deposit().as_yoctonear();
+        require!(att > ATTESTED_STORAGE_RESERVE, "attach 0.1 NEAR for the callback's storage plus the OutLayer fee");
         let args = serde_json::json!({
             "source": { "Project": {
                 "project_id": format!("{}/alpha-vault-strategy", self.owner),
@@ -885,8 +1039,8 @@ impl Vault {
             "secrets_ref": { "profile": "default", "account_id": self.owner },
         });
         Promise::new("outlayer.testnet".parse().unwrap())
-            .function_call("request_execution".to_string(), args.to_string().into_bytes(), env::attached_deposit(), Gas::from_tgas(150))
-            .then(Self::ext(env::current_account_id()).with_static_gas(Gas::from_tgas(40)).on_decision(input_json))
+            .function_call("request_execution".to_string(), args.to_string().into_bytes(), NearToken::from_yoctonear(att - ATTESTED_STORAGE_RESERVE), Gas::from_tgas(150))
+            .then(Self::ext(env::current_account_id()).with_static_gas(Gas::from_tgas(60)).on_decision(input_json))
     }
 
     #[private]
@@ -933,10 +1087,31 @@ impl Vault {
             reject_reason: None,
             execution_ref: None,
             sealed_enc: out["sealed_enc"].as_str().map(|x| x.chars().take(2_000).collect()),
-            input_json: Some(input_json),
+            input_json: Some(input_json.clone()),
         });
+        self.attested_ids.insert(id, true);
         self.last_attested_ms = env::block_timestamp_ms();
         emit("commit", serde_json::json!({"id": id, "commitment": commitment, "path": "onchain"}));
+        // compact output reveals with the commitment: the contract checks the
+        // preimage and applies guardrails right here
+        if let (Some(dj), Some(salt)) = (out["sealed"]["decision_json"].as_str(), out["sealed"]["salt_hex"].as_str()) {
+            if let Err(e) = self.reveal(id, dj.to_string(), salt.to_string()) {
+                emit("attested_reveal_failed", serde_json::json!({"id": id, "reason": e}));
+            }
+        }
+        if let Some(v) = out["settlement"]["external_value_yocto"].as_str().and_then(|x| x.parse::<u128>().ok()) {
+            let blk = out["settlement"]["evm_block"].as_u64().unwrap_or(0);
+            if let Err(e) = self.apply_settlement(v, blk, format!("attested commit #{id}")) {
+                emit("attested_settlement_skipped", serde_json::json!({"id": id, "reason": e}));
+            }
+        }
+        if let Some(h) = out["bundle_sha256"].as_str().filter(|h| h.len() == 64) {
+            let epoch = serde_json::from_str::<serde_json::Value>(&input_json).ok().and_then(|v| v["epoch"].as_u64()).unwrap_or(0);
+            self.expected_bundles.insert(h.to_string(), epoch);
+        }
+        if let Some(e) = out["risk_error"].as_str() {
+            emit("risk_breach", serde_json::json!({"id": id, "reason": e.chars().take(200).collect::<String>()}));
+        }
         Some(id)
     }
 
@@ -969,19 +1144,20 @@ impl Vault {
         self.assert_manager();
         require!(wasm_hash.len() == 64 && hex::decode(&wasm_hash).is_ok(), "wasm_hash must be 32 bytes hex");
         require!(wasm_url.len() <= MAX_REF, "url too long");
-        let at = env::block_timestamp_ms() + ROTATION_DELAY_MS;
-        emit("strategy_proposed", serde_json::json!({"hash": wasm_hash, "url": wasm_url, "effective_at_ms": at}));
-        self.pending_strategy = Some((wasm_hash, wasm_url, at));
+        let p = self.proposal(wasm_hash, wasm_url);
+        emit("strategy_proposed", serde_json::json!({"hash": p.hash, "url": p.url, "effective_at_ms": p.effective_at_ms}));
+        self.pending_strategy = Some(p);
     }
 
-    /// Anyone may apply once the 48h timelock has passed. This is the only
-    /// way an integrity alert is cleared: deliberately, publicly, late.
+    /// Anyone may apply once the 48h timelock has passed, provided the
+    /// proposer still holds the strategy NFT. This is the only way an
+    /// integrity alert is cleared: deliberately, publicly, late.
     pub fn apply_strategy(&mut self) {
-        let (h, u, at) = self.pending_strategy.clone().unwrap_or_else(|| env::panic_str("nothing pending"));
-        require!(env::block_timestamp_ms() >= at, "timelock not elapsed");
-        emit("strategy_rotated", serde_json::json!({"old": self.approved_wasm_hash, "new": h}));
-        self.approved_wasm_hash = h;
-        self.strategy_wasm_url = u;
+        let p = self.pending_strategy.clone().unwrap_or_else(|| env::panic_str("nothing pending"));
+        self.check_due(&p);
+        emit("strategy_rotated", serde_json::json!({"old": self.approved_wasm_hash, "new": p.hash}));
+        self.approved_wasm_hash = p.hash;
+        self.strategy_wasm_url = p.url;
         self.pending_strategy = None;
         self.integrity_alert = None;
         if !self.emergency {
@@ -989,22 +1165,63 @@ impl Vault {
         }
     }
 
-    pub fn propose_wallet(&mut self, mpc_path: String, evm_address: String) {
+    /// Tighten trust immediately: from now on only TDX-attested on-chain
+    /// delivery can commit, execute, settle or prove.
+    pub fn enable_attested(&mut self) {
         self.assert_manager();
-        parse_evm_address(&evm_address);
-        require!(mpc_path.len() <= 64, "path too long");
-        let at = env::block_timestamp_ms() + ROTATION_DELAY_MS;
-        emit("wallet_proposed", serde_json::json!({"path": mpc_path, "evm_address": evm_address, "effective_at_ms": at}));
-        self.pending_wallet = Some((mpc_path, evm_address, at));
+        self.mode = Mode::Attested;
+        self.pending_relayed = None;
+        emit("mode", serde_json::json!({"mode": "attested"}));
     }
 
-    pub fn apply_wallet(&mut self) {
-        let (p, a, at) = self.pending_wallet.clone().unwrap_or_else(|| env::panic_str("nothing pending"));
-        require!(env::block_timestamp_ms() >= at, "timelock not elapsed");
-        emit("wallet_rotated", serde_json::json!({"old": self.evm_address, "new": a, "path": p}));
-        self.mpc_path = p;
-        self.evm_address = a;
-        self.pending_wallet = None;
+    /// Loosening trust back to a relayer is timelocked like a code change.
+    pub fn propose_relayed(&mut self) {
+        self.assert_manager();
+        require!(self.mode == Mode::Attested, "already relayed");
+        let p = self.proposal("relayed".into(), String::new());
+        emit("mode_proposed", serde_json::json!({"mode": "relayed", "effective_at_ms": p.effective_at_ms}));
+        self.pending_relayed = Some(p);
+    }
+
+    pub fn apply_relayed(&mut self) {
+        let p = self.pending_relayed.clone().unwrap_or_else(|| env::panic_str("nothing pending"));
+        self.check_due(&p);
+        self.mode = Mode::Relayed;
+        self.pending_relayed = None;
+        emit("mode", serde_json::json!({"mode": "relayed"}));
+    }
+
+    /// Timelocked self-upgrade. With the account's full-access key deleted,
+    /// this is the only way the contract code can change: the sha256 of the
+    /// new code is public for 48h before anyone can deploy it.
+    pub fn propose_code(&mut self, code_sha256: String) {
+        self.assert_manager();
+        require!(code_sha256.len() == 64 && hex::decode(&code_sha256).is_ok(), "code_sha256 must be 32 bytes hex");
+        let p = self.proposal(code_sha256, String::new());
+        emit("code_proposed", serde_json::json!({"sha256": p.hash, "effective_at_ms": p.effective_at_ms}));
+        self.pending_code = Some(p);
+    }
+
+    /// Anyone, after the timelock: send the proposed code as the raw call
+    /// input. Deploys it and calls its `migrate`.
+    pub fn apply_code(&mut self) -> Promise {
+        let p = self.pending_code.clone().unwrap_or_else(|| env::panic_str("nothing pending"));
+        self.check_due(&p);
+        let code = env::input().unwrap_or_else(|| env::panic_str("send the contract code as raw input"));
+        require!(hex::encode(env::sha256(&code)) == p.hash, "code does not match the proposed sha256");
+        self.pending_code = None;
+        emit("code_upgraded", serde_json::json!({"sha256": p.hash}));
+        Promise::new(env::current_account_id())
+            .deploy_contract(code)
+            .function_call("migrate".to_string(), b"{}".to_vec(), NearToken::from_yoctonear(0), Gas::from_tgas(80))
+    }
+
+    pub fn cancel_proposals(&mut self) {
+        self.assert_manager();
+        self.pending_strategy = None;
+        self.pending_relayed = None;
+        self.pending_code = None;
+        emit("proposals_cancelled", serde_json::json!({}));
     }
 
     // ==================================================================
@@ -1012,13 +1229,11 @@ impl Vault {
     // ==================================================================
 
     /// Mint the manager's fee as shares for gain above the high-water mark.
-    /// Only on a valuation that has stood for 24h (a pumped settlement can't
-    /// be cashed into fees before anyone can see it), and never in emergency.
+    /// Only on REALIZED gains: while any value sits cross-chain (priced by a
+    /// report rather than held as NEAR) no fee can crystallize. Never in
+    /// emergency.
     pub fn crystallize_fees(&mut self) -> U128 {
-        if self.emergency || self.total_shares == 0 || self.perf_fee_bps == 0 {
-            return U128(0);
-        }
-        if self.ext_value > 0 && env::block_timestamp_ms() < self.last_settlement_ms + FEE_SETTLEMENT_AGE_MS {
+        if self.emergency || self.total_shares == 0 || self.perf_fee_bps == 0 || self.ext_value > 0 {
             return U128(0);
         }
         let nav = self.nav();
@@ -1089,8 +1304,11 @@ impl Vault {
             "emergency": self.emergency,
             "mpc_path": self.mpc_path,
             "evm_address": self.evm_address,
-            "pending_wallet": self.pending_wallet,
             "pending_strategy": self.pending_strategy,
+            "mode": self.mode,
+            "pending_relayed": self.pending_relayed,
+            "pending_code": self.pending_code,
+            "deposits_open": !self.emergency && !self.deposits_paused && self.ext_value == 0,
             "commitments": self.commitments.len(),
             "risk_proofs": self.risk_proofs.len(),
             "integrity_alert": self.integrity_alert,
@@ -1134,6 +1352,29 @@ impl Vault {
     }
     fn assert_executor(&self) {
         require!(env::predecessor_account_id() == self.executor, "only the registered executor may relay attested decisions");
+    }
+    fn assert_relayed(&self) {
+        require!(self.mode == Mode::Relayed, "attested mode: only enclave-delivered output may commit, settle or prove");
+    }
+    fn proposal(&self, hash: String, url: String) -> Proposal {
+        Proposal { hash, url, effective_at_ms: env::block_timestamp_ms() + ROTATION_DELAY_MS, proposer: env::predecessor_account_id() }
+    }
+    fn check_due(&self, p: &Proposal) {
+        require!(env::block_timestamp_ms() >= p.effective_at_ms, "timelock not elapsed");
+        require!(self.manager_account() == p.proposer, "proposer no longer holds the strategy NFT");
+    }
+    fn storage_cost(&self, before: u64) -> u128 {
+        u128::from(env::storage_usage().saturating_sub(before)) * env::storage_byte_cost().as_yoctonear()
+    }
+    /// The caller pays for every byte it adds (excess refunded), so relayed
+    /// writes can never eat into shareholders' NEAR.
+    fn charge_storage(&self, before: u64) {
+        let cost = self.storage_cost(before);
+        let att = env::attached_deposit().as_yoctonear();
+        require!(att >= cost, format!("attach at least {cost} yoctoNEAR for storage"));
+        if att > cost {
+            let _ = Promise::new(env::predecessor_account_id()).transfer(NearToken::from_yoctonear(att - cost));
+        }
     }
 
     fn record_nav(&mut self) {
@@ -1192,10 +1433,11 @@ impl Vault {
 }
 
 // ---------------------------------------------------------------------------
-// Migration v3 -> v4. Deployed atomically with the code.
+// Migration v4 -> v5. Deployed atomically with the code. Future versions
+// arrive via the timelocked `apply_code`, which calls `migrate`.
 // ---------------------------------------------------------------------------
 #[near(serializers = [borsh])]
-pub struct VaultV3 {
+pub struct VaultV4 {
     owner: AccountId,
     executor: AccountId,
     approved_wasm_hash: String,
@@ -1203,12 +1445,14 @@ pub struct VaultV3 {
     total_shares: u128,
     shares: LookupMap<AccountId, u128>,
     pool: u128,
-    external_value: u128,
+    ext_value: u128,
     last_settlement_ref: Option<String>,
+    last_settlement_ms: u64,
     strategy_wasm_url: String,
     commitments: Vector<TradeCommitment>,
     risk_proofs: Vector<StoredRiskProof>,
     nav_log: Vector<NavPoint>,
+    nav_log_head: u32,
     perf_fee_bps: u64,
     hwm_nav_per_share: u128,
     integrity_alert: Option<String>,
@@ -1218,24 +1462,32 @@ pub struct VaultV3 {
     last_attested_ms: u64,
     liveness_timeout_ms: u64,
     emergency: bool,
-    external_claims: LookupMap<AccountId, u128>,
-    claim_paid: LookupMap<AccountId, u128>,
-    total_claims: u128,
-    recovered_total: u128,
+    ext_units_total: u128,
+    vault_ext_units: u128,
+    ext_units: LookupMap<AccountId, u128>,
+    ext_debt: LookupMap<AccountId, u128>,
+    ext_pending: LookupMap<AccountId, u128>,
+    ext_acc: u128,
+    repatriated_total: u128,
+    ext_paid_total: u128,
     mpc_path: String,
-    pending_mpc_path: Option<(String, u64)>,
+    evm_address: String,
+    pending_wallet: Option<(String, String, u64)>,
+    pending_strategy: Option<(String, String, u64)>,
+    signed_legs: LookupMap<String, bool>,
+    failed_payouts: LookupMap<AccountId, u128>,
 }
 
 #[near]
 impl Vault {
     #[private]
     #[init(ignore_state)]
-    pub fn migrate_v4(mpc_path: String, evm_address: String) -> Self {
-        let o: VaultV3 = env::state_read().expect("no v3 state to migrate");
-        require!(o.total_claims == 0, "v3 claims outstanding: migrate them first");
-        parse_evm_address(&evm_address);
-        let units = if o.external_value > 0 { EXT_UNITS_BASE } else { 0 };
-        emit("migrated", serde_json::json!({"to": "v4", "ext_units": units.to_string()}));
+    pub fn migrate() -> Self {
+        let o: VaultV4 = env::state_read().expect("no v4 state to migrate");
+        require!(o.pending_wallet.is_none(), "a wallet rotation is pending: v5 removes rotation, cancel it first");
+        let manager = o.nft.owner_by_id.get(&STRATEGY_TOKEN_ID.to_string()).unwrap_or_else(|| o.owner.clone());
+        let pending_strategy = o.pending_strategy.map(|(hash, url, at)| Proposal { hash, url, effective_at_ms: at, proposer: manager });
+        emit("migrated", serde_json::json!({"to": "v5"}));
         Self {
             owner: o.owner,
             executor: o.executor,
@@ -1244,14 +1496,14 @@ impl Vault {
             total_shares: o.total_shares,
             shares: o.shares,
             pool: o.pool,
-            ext_value: o.external_value,
+            ext_value: o.ext_value,
             last_settlement_ref: o.last_settlement_ref,
-            last_settlement_ms: 0,
+            last_settlement_ms: o.last_settlement_ms,
             strategy_wasm_url: o.strategy_wasm_url,
             commitments: o.commitments,
             risk_proofs: o.risk_proofs,
             nav_log: o.nav_log,
-            nav_log_head: 0,
+            nav_log_head: o.nav_log_head,
             perf_fee_bps: o.perf_fee_bps,
             hwm_nav_per_share: o.hwm_nav_per_share,
             integrity_alert: o.integrity_alert,
@@ -1261,20 +1513,24 @@ impl Vault {
             last_attested_ms: o.last_attested_ms,
             liveness_timeout_ms: o.liveness_timeout_ms,
             emergency: o.emergency,
-            ext_units_total: units,
-            vault_ext_units: units,
-            ext_units: LookupMap::new(StorageKey::ExtUnits),
-            ext_debt: LookupMap::new(StorageKey::ExtDebt),
-            ext_pending: LookupMap::new(StorageKey::ExtPending),
-            ext_acc: 0,
-            repatriated_total: 0,
-            ext_paid_total: 0,
-            mpc_path,
-            evm_address,
-            pending_wallet: None,
-            pending_strategy: None,
-            signed_legs: LookupMap::new(StorageKey::SignedLegs),
-            failed_payouts: LookupMap::new(StorageKey::FailedPayouts),
+            ext_units_total: o.ext_units_total,
+            vault_ext_units: o.vault_ext_units,
+            ext_units: o.ext_units,
+            ext_debt: o.ext_debt,
+            ext_pending: o.ext_pending,
+            ext_acc: o.ext_acc,
+            repatriated_total: o.repatriated_total,
+            ext_paid_total: o.ext_paid_total,
+            mpc_path: o.mpc_path,
+            evm_address: o.evm_address,
+            pending_strategy,
+            signed_legs: o.signed_legs,
+            failed_payouts: o.failed_payouts,
+            mode: Mode::Relayed,
+            pending_relayed: None,
+            pending_code: None,
+            attested_ids: LookupMap::new(StorageKey::AttestedIds),
+            expected_bundles: LookupMap::new(StorageKey::ExpectedBundles),
         }
     }
 }

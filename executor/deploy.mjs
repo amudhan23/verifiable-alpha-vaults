@@ -72,6 +72,11 @@ await contract.deployContract(wasm);
 // 3. init (only on a fresh account)
 if (fresh) {
   console.log(`→ init: owner/executor=${masterId}, approved wasm ${wasmHash.slice(0, 12)}…`);
+  // the vault's own EVM wallet: MPC derivation for (this contract, path)
+  const { ChainSigExecutor } = await import("./evm.mjs");
+  const mpcPath = process.env.MPC_PATH ?? "alpha-vault-v1";
+  const evmAddress = await new ChainSigExecutor({ accountId: contractId, privateKey: process.env.NEAR_PRIVATE_KEY, derivationPath: mpcPath }).address();
+  console.log(`→ vault EVM wallet ${evmAddress} (fund it with Sepolia ETH)`);
   await contract.functionCall({
     contractId,
     methodName: "new",
@@ -79,12 +84,15 @@ if (fresh) {
       owner: masterId,
       executor: masterId,
       approved_wasm_hash: wasmHash,
+      strategy_wasm_url: process.env.STRATEGY_WASM_URL ?? "",
       guardrails: {
         max_leverage_bps: 30_000,
         max_drawdown_bps: 2_000,
         max_position_bps: 5_000,
         allowed_pairs: ["ETH/USDC", "NEAR/USDC"],
       },
+      mpc_path: mpcPath,
+      evm_address: evmAddress,
     },
     gas: 100_000_000_000_000n,
   });

@@ -36,19 +36,29 @@ export class NearVault {
     return account.functionCall({ contractId: this.cfg.contractId, methodName, args, gas, attachedDeposit: BigInt(deposit) });
   }
 
-  async call(methodName, args, gas = 100_000_000_000_000n) {
+  async call(methodName, args, gas = 100_000_000_000_000n, deposit = 0n) {
     const account = await this.account();
     const res = await account.functionCall({
       contractId: this.cfg.contractId,
       methodName,
       args,
       gas,
+      attachedDeposit: BigInt(deposit),
     });
     return res;
   }
 
+  /** v5: the relayer pays for every byte it writes (excess is refunded). */
+  static storageFor(args) {
+    return BigInt(JSON.stringify(args).length + 600) * 10_000_000_000_000_000_000n; // 1e19 yocto/byte
+  }
+
+  async paidCall(methodName, args, gas) {
+    return this.call(methodName, args, gas, NearVault.storageFor(args));
+  }
+
   async commitDecision(commitment, wasmHash, attestationRef, inputJson = null) {
-    const res = await this.call("commit_decision", {
+    const res = await this.paidCall("commit_decision", {
       commitment,
       wasm_hash: wasmHash,
       attestation_ref: attestationRef,
@@ -59,15 +69,15 @@ export class NearVault {
   }
 
   async executeDecision(id, decisionJson, saltHex) {
-    await this.call("execute_decision", { id, decision_json: decisionJson, salt_hex: saltHex });
+    await this.paidCall("execute_decision", { id, decision_json: decisionJson, salt_hex: saltHex });
   }
 
   async postRiskProof(epoch, bundleJson) {
-    await this.call("post_risk_proof", { epoch, bundle_json: bundleJson });
+    await this.paidCall("post_risk_proof", { epoch, bundle_json: bundleJson });
   }
 
   async settlePnl(externalValueYocto, evmBlock, attestationRef) {
-    await this.call("settle_pnl", {
+    await this.paidCall("settle_pnl", {
       ext_value: externalValueYocto,
       evm_block: evmBlock,
       attestation_ref: attestationRef,
@@ -75,7 +85,7 @@ export class NearVault {
   }
 
   async recordExecutionRef(id, executionRef) {
-    await this.call("record_execution_ref", { id, execution_ref: executionRef });
+    await this.paidCall("record_execution_ref", { id, execution_ref: executionRef });
   }
 
   async view(methodName, args = {}) {

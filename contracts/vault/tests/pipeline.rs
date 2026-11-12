@@ -64,6 +64,7 @@ fn market_input() -> RunInput {
         max_drawdown_bps: 2_000,
         settle: None,
         vault_state: None,
+        compact: false,
     }
 }
 
@@ -88,7 +89,7 @@ fn full_pipeline_honest_vault() {
     let bundle = out.risk_bundle.expect("honest run proves risk");
 
     // executor commits the hash FIRST (this is what makes back-filling impossible)
-    ctx("executor.testnet", 0);
+    ctx("executor.testnet", 100_000_000_000_000_000_000_000);
     let id = v.commit_decision(out.commitment.clone(), WASM_HASH.into(), "outlayer-exec-1".into(), state_input(&v));
 
     // ...trade executes on the target chain... then reveal
@@ -129,7 +130,7 @@ fn full_pipeline_greedy_params_are_stopped_twice() {
     assert!(out.risk_bundle.is_none());
 
     // layer 2: the contract refuses the reveal before anything is signed
-    ctx("executor.testnet", 0);
+    ctx("executor.testnet", 100_000_000_000_000_000_000_000);
     let id = v.commit_decision(out.commitment.clone(), WASM_HASH.into(), "outlayer-exec-2".into(), state_input(&v));
     v.execute_decision(id, out.sealed.as_ref().unwrap().decision_json.clone(), out.sealed.as_ref().unwrap().salt_hex.clone());
     let c = v.get_commitment(id).unwrap();
@@ -145,7 +146,7 @@ fn full_pipeline_backfilled_winner_is_caught() {
 
     // honest commit...
     let out = run(&params, &market_input(), [42u8; 32]);
-    ctx("executor.testnet", 0);
+    ctx("executor.testnet", 100_000_000_000_000_000_000_000);
     let id = v.commit_decision(out.commitment, WASM_HASH.into(), "outlayer-exec-3".into(), state_input(&v));
 
     // ...but the manager tries to reveal a different, winning trade
@@ -160,7 +161,7 @@ fn full_pipeline_swapped_code_is_detected() {
     let mut v = vault();
     let params = Params { fast: 3, slow: 8, threshold_bps: 50, size_bps: 4_000, leverage_bps: 25_000, seal_key_hex: None };
     let out = run(&params, &market_input(), [42u8; 32]);
-    ctx("executor.testnet", 0);
+    ctx("executor.testnet", 100_000_000_000_000_000_000_000);
     // attestation says different code ran: recorded as Rejected (not a panic,
     // which would revert the alert on-chain) and deposits pause
     let other_hash = "ab".repeat(32);

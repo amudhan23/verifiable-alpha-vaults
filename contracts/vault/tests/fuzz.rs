@@ -13,7 +13,8 @@
 //!  S5  a withdrawal pays exactly the pro-rata slice of the pool, whatever
 //!      the settled valuation says
 //!  S6  a deposit never mints shares worth more than it paid
-//!  S7  no fee is minted without a new high (and none on fresh valuations)
+//!  S7  no fee is minted without a new high, and none while value is cross-chain
+//!  S8  a deposit only ever succeeds while the vault is fully in NEAR
 
 use near_sdk::json_types::U128;
 use near_sdk::test_utils::VMContextBuilder;
@@ -107,8 +108,10 @@ proptest! {
                     let amt = (milli as u128 * NEAR / 1000).max(MIN_DEPOSIT);
                     let a = acct(who);
                     ctx(&a, amt, t);
+                    let ext_before = v.ext_value;
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| v.deposit().0));
                     let Ok(minted) = r else { continue };
+                    prop_assert_eq!(ext_before, 0, "S8: deposit priced off a cross-chain valuation");
                     // S6
                     prop_assert!(mul_div(v.nav(), minted, v.total_shares) <= amt);
                     held += amt as i128;
@@ -137,7 +140,7 @@ proptest! {
                     // convert holders' target back to whole-wallet value
                     let new_ext = if v.ext_units_total == 0 { target_holders }
                         else { mul_div(target_holders, v.ext_units_total, v.vault_ext_units.max(1)) };
-                    ctx(&executor(), 0, t);
+                    ctx(&executor(), NEAR / 10, t);
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| v.settle_pnl(U128(new_ext), 1, "fuzz".into())));
                 }
                 Op::Repatriate { milli } => {
@@ -158,9 +161,10 @@ proptest! {
                 Op::Crystallize => {
                     let m0 = v.get_shares(acct(4)).0;
                     let above = nps(&v) > v.hwm_nav_per_share;
+                    let cross_chain = v.ext_value > 0;
                     ctx(&acct(4), 0, t);
                     v.crystallize_fees();
-                    if !above { prop_assert_eq!(v.get_shares(acct(4)).0, m0, "S7"); }
+                    if !above || cross_chain { prop_assert_eq!(v.get_shares(acct(4)).0, m0, "S7"); }
                 }
                 Op::Emergency => {
                     if v.emergency { continue; }

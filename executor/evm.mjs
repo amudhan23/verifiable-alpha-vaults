@@ -229,8 +229,20 @@ export class ChainSigExecutor {
 // executor rebuilds the same tx locally, checks the hash matches what the
 // vault signed, attaches the signature, and broadcasts.
 // ---------------------------------------------------------------------------
-const GAS = { wrap: 120_000n, approve: 120_000n, swap: 350_000n };
-const MAX_FEE_CAP = 300_000_000_000n; // mirror the contract cap
+// per-leg caps, mirrored from the v5 contract
+const GAS = { wrap: 200_000n, approve: 120_000n, swap: 400_000n };
+const MAX_FEE_CAP = 100_000_000_000n;
+
+/** The exact swap calldata the v5 contract builds: multicall(deadline, [exactInputSingle ‖ commitment]). */
+export function swapCalldata(viem, { tokenIn, tokenOut, fee, recipient, amountIn, minOut, deadline, commitment }) {
+  const routerAbi = viem.parseAbi([
+    "function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96)) payable returns (uint256)",
+    "function multicall(uint256 deadline, bytes[] data) payable returns (bytes[])",
+  ]);
+  const inner = viem.encodeFunctionData({ abi: routerAbi, functionName: "exactInputSingle",
+    args: [{ tokenIn, tokenOut, fee, recipient, amountIn, amountOutMinimum: minOut, sqrtPriceLimitX96: 0n }] }) + commitment;
+  return viem.encodeFunctionData({ abi: routerAbi, functionName: "multicall", args: [deadline, [inner]] });
+}
 
 export class VaultSignedExecutor {
   /** @param {{vault: import('./vault.mjs').NearVault, vaultId: string, mpcPath?: string}} cfg */
@@ -267,7 +279,7 @@ export class VaultSignedExecutor {
   }
 
   /** Ask the vault to sign one leg; verify; broadcast; wait. */
-  async leg(id, leg, { to, value = 0n, data, amountIn = 0n, amountOutMin = 0n, feeTier = 3000 }) {
+  async leg(id, leg, { to, value = 0n, data, deadline = 0n }) {
     const { serializeTransaction, keccak256 } = this.viem;
     const nonce = await this.pub.getTransactionCount({ address: this.address, blockTag: "pending" });
     const fees = await this.pub.estimateFeesPerGas();
@@ -275,10 +287,10 @@ export class VaultSignedExecutor {
     if (maxFeePerGas > MAX_FEE_CAP) maxFeePerGas = MAX_FEE_CAP;
     let maxPriorityFeePerGas = fees.maxPriorityFeePerGas ?? 1_000_000_000n;
     if (maxPriorityFeePerGas > maxFeePerGas) maxPriorityFeePerGas = maxFeePerGas;
-    // estimate per tx (+30%), fallback to defaults; capped at the vault's 400k
+    // estimate per tx (+30%), fallback to defaults; capped at the vault's per-leg cap
     let gas = GAS[leg];
     try { gas = (await this.pub.estimateGas({ account: this.address, to, value, data })) * 13n / 10n; } catch { /* e.g. swap before approve is mined */ }
-    if (gas > 400_000n) gas = 400_000n;
+    if (gas > GAS[leg]) gas = GAS[leg];
     const tx = { type: "eip1559", chainId: 11155111, nonce, maxFeePerGas, maxPriorityFeePerGas, gas, to, value, data };
     const localHash = keccak256(serializeTransaction(tx)).slice(2);
 
@@ -287,10 +299,8 @@ export class VaultSignedExecutor {
       max_fee_per_gas: maxFeePerGas.toString(),
       max_priority_fee_per_gas: maxPriorityFeePerGas.toString(),
       gas_limit: Number(gas),
-      amount_in: amountIn.toString(),
-      amount_out_min: amountOutMin.toString(),
-      fee_tier: feeTier,
-    }, 300_000_000_000_000n, "1");
+      deadline_s: Number(deadline),
+    }, 300_000_000_000_000n, "5000000000000000000000"); // 0.005 NEAR: leg storage + MPC fee
     const logs = res.receipts_outcome.flatMap((r) => r.outcome.logs);
     const req = logs.map((l) => l.match(/"event":"evm_sign_requested".*"payload":"([0-9a-f]{64})"/)).find(Boolean);
     if (!req) throw new Error("vault did not log a sign request");
@@ -311,44 +321,52 @@ export class VaultSignedExecutor {
     }
   }
 
-  /** Execute an executed (revealed + guardrail-passed) decision. */
-  async executeTrade({ id, commitment, decision, ethUsd, tradeEthWei = 2_000_000_000_000_000n }) {
+  /**
+   * Execute an executed (revealed + guardrail-passed) decision. v5: the size,
+   * slippage floor and fee tier are the ENCLAVE's (inside the committed
+   * decision); the executor only checks the pool can meet the floor before
+   * spending gas, and broadcasts what the vault signs.
+   */
+  async executeTrade({ id, commitment, decision }) {
     await this.init();
     const { encodeFunctionData, parseAbi } = this.viem;
     const erc20 = parseAbi(["function approve(address,uint256) returns (bool)", "function allowance(address,address) view returns (uint256)", "function deposit() payable"]);
-    const routerAbi = parseAbi(["function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96)) payable returns (uint256)"]);
     const txs = [];
+    if (decision.action !== "buy" && decision.action !== "sell") return { ref: null, txs, filled: false, detail: "hold" };
+    const amountIn = BigInt(decision.amount_in || 0);
+    const minOut = BigInt(decision.min_out || 0);
+    const fee = Number(decision.fee_tier || 0);
+    if (amountIn === 0n || minOut === 0n) return { ref: null, txs, filled: false, detail: "decision carries no trade size (pre-v2 strategy): nothing to sign" };
     const bal = await this.balances();
-    let tokenIn, tokenOut, amountIn;
-    if (decision.action === "sell") {
-      tokenIn = UNI.weth; tokenOut = UNI.usdc; amountIn = tradeEthWei;
-      if (bal.weth < amountIn) {
-        const need = amountIn - bal.weth;
-        txs.push(await this.leg(id, "wrap", { to: UNI.weth, value: need, data: "0xd0e30db0", amountIn: need }));
-      }
-    } else if (decision.action === "buy") {
-      tokenIn = UNI.usdc; tokenOut = UNI.weth; amountIn = bal.usdc / 2n;
-      if (amountIn === 0n) return { ref: null, txs, filled: false, detail: "buy skipped: no USDC to deploy" };
-    } else return { ref: null, txs, filled: false, detail: "hold" };
-
+    const [tokenIn, tokenOut] = decision.action === "sell" ? [UNI.weth, UNI.usdc] : [UNI.usdc, UNI.weth];
+    // the pool must be able to meet the enclave's floor, or the swap would revert and burn gas
+    const quote = await this.quoteExact(tokenIn, tokenOut, amountIn, fee);
+    if (quote < minOut) {
+      return { ref: `refused:pool quote ${quote} < enclave floor ${minOut}`, txs, filled: false,
+        detail: `REFUSED: pool would return ${quote}, below the enclave's slippage floor ${minOut} (Sepolia pools are mispriced vs the oracle)` };
+    }
+    if (decision.action === "sell" && bal.weth < amountIn) {
+      txs.push(await this.leg(id, "wrap", { to: UNI.weth, value: amountIn, data: "0xd0e30db0" }));
+    }
     const allowance = await this.pub.readContract({ address: tokenIn, abi: erc20, functionName: "allowance", args: [this.address, UNI.router] });
     if (allowance < amountIn) {
       txs.push(await this.leg(id, "approve", { to: tokenIn, data: encodeFunctionData({ abi: erc20, functionName: "approve", args: [UNI.router, 2n ** 256n - 1n] }) }));
     }
-    const q = await this.bestQuote(tokenIn, tokenOut, amountIn);
-    const poolEthUsd = tokenIn === UNI.weth ? (Number(q.out) / 1e6) / (Number(amountIn) / 1e18) : (Number(amountIn) / 1e6) / (Number(q.out) / 1e18);
-    const deviation = ethUsd ? Math.abs(poolEthUsd / ethUsd - 1) : 0;
-    const devNote = `pool ETH $${poolEthUsd.toFixed(0)} vs oracle $${ethUsd?.toFixed(0)} (${(deviation * 100).toFixed(1)}% off)`;
-    if (deviation > 0.05 && process.env.ALLOW_POOL_DEVIATION !== "1") {
-      return { ref: `refused:${devNote}`, txs, filled: false, detail: `REFUSED: ${devNote}` };
-    }
-    const minOut = (q.out * 9_800n) / 10_000n;
-    const data = encodeFunctionData({ abi: routerAbi, functionName: "exactInputSingle",
-      args: [{ tokenIn, tokenOut, fee: q.fee, recipient: this.address, amountIn, amountOutMinimum: minOut, sqrtPriceLimitX96: 0n }] }) + commitment;
-    const swap = await this.leg(id, "swap", { to: UNI.router, data, amountIn, amountOutMin: minOut, feeTier: q.fee });
+    const deadline = BigInt(Math.floor(Date.now() / 1000) + 1200);
+    const data = swapCalldata(this.viem, { tokenIn, tokenOut, fee, recipient: this.address, amountIn, minOut, deadline, commitment });
+    const swap = await this.leg(id, "swap", { to: UNI.router, data, deadline });
     txs.push(swap);
     const filled = swap.status === "success";
     return { ref: filled ? swap.hash : `reverted:${swap.hash}`, txs, filled,
-      detail: `${decision.action} via Uniswap v3 ${q.fee / 10000}% · vault-signed · ${devNote}${deviation > 0.05 ? " [testnet override]" : ""}` };
+      detail: `${decision.action} ${amountIn} via Uniswap v3 ${fee / 10000}% · enclave-sized, floor ${minOut} · vault-signed` };
+  }
+
+  async quoteExact(tokenIn, tokenOut, amountIn, fee) {
+    const quoterAbi = this.viem.parseAbi(["function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256 amountOut,uint160,uint32,uint256)"]);
+    try {
+      const { result } = await this.pub.simulateContract({ address: UNI.quoter, abi: quoterAbi, functionName: "quoteExactInputSingle",
+        args: [{ tokenIn, tokenOut, amountIn, fee, sqrtPriceLimitX96: 0n }] });
+      return result[0];
+    } catch { return 0n; }
   }
 }
