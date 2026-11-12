@@ -26,7 +26,7 @@ things independently verifiable:
 > additionally keeps epoch risk *metrics* (peak leverage, drawdown path)
 > private while proving they stayed within the public limits.
 
-![Vault page: all three verifications green after running the checks in-browser](docs/img/vault.png)
+![Running all checks against the LIVE testnet vault: TDX attestations fetched, commitments recomputed, Bulletproofs verified — in the browser](docs/img/checks-live.gif)
 
 ![Leaderboard: three vaults with verification chips](docs/img/leaderboard.png)
 
@@ -102,7 +102,7 @@ cargo run -q -p vault-strategy
 
 The frontend ships a console that runs the three cheats live:
 
-![Red-team console](docs/img/redteam.png)
+![Red-team console](docs/img/redteam.gif)
 
 ## Testnet deployment
 
