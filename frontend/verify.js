@@ -86,9 +86,13 @@ export async function checkCodeAttestedDeep(vault, onStep = () => {}) {
     }
   }
   const builds = new Set(vault.commitments.map((c) => c.wasm_hash)).size;
+  // commitments the vault created in its own callback from OutLayer's
+  // on-chain request_execution: only DCAP-verified TDX workers can resolve it,
+  // and the run was pinned to the approved build by the contract itself
+  const onchain = vault.commitments.filter((c) => c.attestation_ref?.startsWith("onchain")).length;
   return {
     state: "ok",
-    detail: `${verified} TDX attestations fetched: executed code = recorded code on all${builds > 1 ? ` (${builds - 1} logged strategy rotation)` : ""}`,
+    detail: `${verified} TDX attestations fetched: executed code = recorded code on all${builds > 1 ? ` (${builds - 1} logged strategy rotation)` : ""}${onchain ? `; ${onchain} delivered on-chain by OutLayer's TDX workers straight to the vault` : ""}`,
   };
 }
 

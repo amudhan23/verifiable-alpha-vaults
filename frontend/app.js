@@ -173,7 +173,7 @@ async function renderVault(id) {
         <td class="num">#${c.id}</td>
         <td><span class="hash">${short(c.commitment)}</span></td>
         <td>${d ? (d.action === "hold" ? `<span class="muted">hold</span>` : `${esc(d.action)} ${esc(d.pair)} <span class="muted">(${(d.leverage_bps / 10000).toFixed(1)}x, ${(d.size_bps / 100).toFixed(0)}% NAV)</span>`) : `<span class="muted">sealed until execution</span>`}</td>
-        <td>${stateChip}</td>
+        <td>${stateChip}${c.attestation_ref?.startsWith("onchain") ? ` <span class="annot" title="Created by the vault's own callback from OutLayer's on-chain request: no relayer in between">on-chain</span>` : ""}</td>
         <td class="num muted">${when(c.committed_at_ms)}</td>
       </tr>
       <tr class="detail-row" data-for="${c.id}" hidden><td colspan="5">
