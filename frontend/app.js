@@ -207,6 +207,7 @@ async function renderVault(id) {
     </div>
     <p class="certline">This page certifies that every decision below was committed on NEAR before it executed anywhere, attested by Intel TDX to the approved code, computed from real market prices, and bounded by the stated guardrails — or shows you exactly where that failed.</p>
     <div class="stamp-row" id="stamps" aria-live="polite"></div>
+    ${v.emergency ? `<div class="alert"><b>Emergency exit mode.</b> No attested decision for over ${Math.round(v.liveness_timeout_ms / 3.6e6)}h. Trading is frozen; withdrawals pay your share of the local pool now and record a claim on cross-chain value.</div>` : ""}
     ${v.integrity_alert ? `<div class="alert"><b>Integrity alert — deposits paused.</b> A decision arrived attested to different code: <code>${esc(v.integrity_alert)}</code></div>` : ""}
     <div class="cols">
       <div class="panel"><h3>Net asset value${v.return_pct == null ? "" : ` · ${fmtPct(v.return_pct)} per share`}</h3>${navChart(v)}${v.external_near > 0 ? `<p class="muted" style="font-size:12.5px; font-style:italic; margin:8px 0 0">The step up is seed capital bridged to the cross-chain wallet. It was minted as shares at NAV/share, so it changed the vault’s size, not its return.</p>` : ""}</div>
@@ -219,6 +220,7 @@ async function renderVault(id) {
           <dt>net asset value</dt><dd>${v.pool_near} NEAR</dd>
           ${v.external_near != null ? `<dt>· on NEAR</dt><dd>${v.local_near} NEAR</dd><dt>· cross-chain</dt><dd>${v.external_near} NEAR</dd>` : ""}
           ${v.last_settlement_ref ? `<dt>last settlement</dt><dd style="font-size:11px">${esc(v.last_settlement_ref.slice(0, 34))}…</dd>` : ""}
+          ${v.last_attested_ms ? `<dt>exit guarantee</dt><dd style="font-size:11.5px">${v.emergency ? "EMERGENCY — withdraw pro rata" : `anyone may trigger exit if silent ${Math.round(v.liveness_timeout_ms / 3.6e6)}h (last: ${when(v.last_attested_ms)})`}</dd>` : ""}
           <dt>perf fee</dt><dd>20% above high-water mark</dd>
           <dt>manager</dt><dd title="holder of the strategy NFT">${esc(v.manager)}</dd>
         </dl>

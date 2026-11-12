@@ -66,3 +66,13 @@ executor-crash runs; #6 the rejected 10x breach; #7–#8 red-team targets.
 ### Bugs found and fixed (on the live vault)
 - **u128 overflow in share math.** `amount × total_shares` in yoctoNEAR (1e24 × 1e24) exceeds u128, and `saturating_mul` silently clamped it. The seed settlement minted about 3.4e14 shares instead of 29.6e24, and *any* second 1-NEAR deposit would have been mis-minted. Fixed with 256-bit `mul_div` everywhere (deposit, withdraw, fees, settlement), plus tests at real yocto scale (the old tests used tiny numbers and missed it). Live state repaired via a one-time `#[private] repair_seed_mint`, deployed **atomically** with the fix (tx `4vt3tyNV…`): NAV/share is back to 1.000.
 - **State-layout change on upgrade.** New fields would have bricked the deployed vault's borsh state. Fixed with a v1→v2 `migrate`, unit-tested on real v1 state and deployed atomically with the code (tx `2rKbS8yd…`): all 10 commitments preserved.
+
+## Exit guarantees (v3, live, tx `7SgrykuH…`)
+
+What happens if the manager, executor, or OutLayer disappears. No admin key can block any of this:
+
+- **Liveness timeout (24h):** every attested decision resets `last_attested_ms`. If it goes stale, **anyone** can call `trigger_emergency()`. It's one-way; the manager cannot cancel it.
+- **Emergency withdraw:** pays your pro-rata share of the local NEAR pool immediately and records a pro-rata **claim** on the cross-chain value. Remaining holders keep exactly their proportion.
+- **Recovery:** anyone can `deposit_recovered()` repatriated value; `claim_recovered()` pays each claimant pro rata, capped at their claim. No double-claiming (tested).
+- **MPC path rotation:** `propose_mpc_path` → 48h timelock → `apply_mpc_path` (callable by anyone). Depositors who object can exit first.
+- **Honest limit:** funds already on the EVM address can only move with NEAR's MPC network signing for the vault's path. The guarantee covers the NEAR side completely and makes the cross-chain side an enforceable, transparent claim. It cannot make the MPC network unnecessary.
