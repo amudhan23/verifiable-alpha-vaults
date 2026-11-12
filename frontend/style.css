@@ -219,6 +219,7 @@ h2 .annot { font-weight: 400; font-style: italic; font-size: 14.5px; color: var(
   padding: 12px 16px; margin: 0 0 20px;
 }
 .alert code { color: var(--void); word-break: break-all; }
+.alert.notice { border-color: var(--wax); background: var(--wax-soft); }
 
 .cols { display: grid; grid-template-columns: 1.5fr 1fr; gap: 20px; }
 .panel {

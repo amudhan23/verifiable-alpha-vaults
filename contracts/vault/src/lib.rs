@@ -721,6 +721,7 @@ impl Vault {
     // Strategy: commit -> reveal (guarded) -> vault-signed execution
     // ==================================================================
 
+    #[payable]
     pub fn commit_decision(
         &mut self,
         commitment: String,

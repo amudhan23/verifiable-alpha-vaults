@@ -210,9 +210,10 @@ async function renderVault(id) {
     <div class="stamp-row" id="stamps" aria-live="polite"></div>
     ${v.live ? `<div class="panel position" id="position"><h3>Your position</h3><p class="muted">Loading wallet…</p></div>` : ""}
     ${v.emergency ? `<div class="alert"><b>Emergency exit mode.</b> No attested decision for over ${Math.round(v.liveness_timeout_ms / 3.6e6)}h. Trading is frozen; withdrawals pay your share of the local pool now and record a claim on cross-chain value.</div>` : ""}
+    ${v.pending_strategy ? `<div class="alert notice"><b>Strategy change proposed.</b> New code <span class="hash">${short(v.pending_strategy.hash)}</span> can take over ${new Date(v.pending_strategy.effective_at_ms) > new Date() ? `from ${new Date(v.pending_strategy.effective_at_ms).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}` : "now: anyone can apply it"}. Changes to what code runs are public for 48 hours first, so you can leave before they apply.</div>` : ""}
     ${v.integrity_alert ? `<div class="alert"><b>Integrity alert — deposits paused.</b> A decision arrived attested to different code: <code>${esc(v.integrity_alert)}</code></div>` : ""}
     <div class="cols">
-      <div class="panel"><h3>Net asset value${v.return_pct == null ? "" : ` · ${fmtPct(v.return_pct)} per share`}</h3>${navChart(v)}${v.external_near > 0 ? `<p class="muted" style="font-size:12.5px; font-style:italic; margin:8px 0 0">The step up is seed capital bridged to the cross-chain wallet. It was minted as shares at NAV/share, so it changed the vault’s size, not its return.</p>` : ""}</div>
+      <div class="panel"><h3>Net asset value${v.return_pct == null ? "" : ` · ${fmtPct(v.return_pct)} per share`}</h3>${navChart(v)}${v.external_near > 0 ? `<p class="muted" style="font-size:12.5px; font-style:italic; margin:8px 0 0">The step up is the vault’s cross-chain wallet being valued for the first time. The manager funded that wallet and holds every share, so this is a valuation report, not a realized return: no fee can be charged on it until it comes back as NEAR.</p>` : ""}</div>
       <div class="panel"><h3>Terms of issue</h3>
         <dl class="kv">
           <dt>max leverage</dt><dd>${(g.max_leverage_bps / 10000).toFixed(1)}x</dd>
@@ -224,10 +225,12 @@ async function renderVault(id) {
           ${v.evm_address ? `<dt>cross-chain wallet</dt><dd style="font-size:11px"><a href="https://sepolia.etherscan.io/address/${esc(v.evm_address)}" target="_blank" rel="noopener">${esc(v.evm_address.slice(0, 10))}…</a> (vault-owned)</dd>` : ""}
           ${v.last_settlement_ref ? `<dt>last settlement</dt><dd style="font-size:11px">${esc(v.last_settlement_ref.slice(0, 34))}…</dd>` : ""}
           ${v.last_attested_ms ? `<dt>exit guarantee</dt><dd style="font-size:11.5px">${v.emergency ? "EMERGENCY — withdraw pro rata" : `anyone may trigger exit if silent ${Math.round(v.liveness_timeout_ms / 3.6e6)}h (last: ${when(v.last_attested_ms)})`}</dd>` : ""}
-          <dt>perf fee</dt><dd>20% above high-water mark</dd>
+          ${v.mode ? `<dt>trust mode</dt><dd>${v.mode === "Attested" ? "attested: only TDX-delivered output can act" : `relayed by <span title="openly trusted to deliver enclave output on time">${esc(v.executor ?? "executor")}</span>`}</dd>` : ""}
+          <dt>perf fee</dt><dd>20% of realized gains above high-water mark</dd>
           <dt>manager</dt><dd title="holder of the strategy NFT">${esc(v.manager)}</dd>
         </dl>
         <p class="muted" style="font-size:12.5px; margin:10px 0 0">The sealed strategy decides <em>what</em> to trade; it cannot decide to exceed these. A breach is refused before any signature exists.</p>
+        ${v.mode === "Relayed" ? `<p class="muted" style="font-size:12.5px; margin:8px 0 0">In relayed mode the relayer can delay a run or misreport the cross-chain value on the chart. It cannot choose trade sizes, price your deposit or cash a fee: deposits only open while everything is in NEAR, and fees only come from NEAR that has actually returned.</p>` : ""}
       </div>
     </div>
     <h2>Decision ledger <span class="annot">— each entry committed on NEAR before execution; open a row to inspect</span></h2>
@@ -285,9 +288,10 @@ async function renderPosition(v) {
       ${hasUnits ? `<dt>cross-chain units</dt><dd>≈ ${W.yoctoToNear(ext.est_value_yocto)} NEAR</dd>` : ""}
       ${claimable ? `<dt>claimable now</dt><dd>${W.yoctoToNear(ext.claimable_yocto)} NEAR</dd>` : ""}
     </dl>
+    ${!emergency && s.deposits_open === false ? `<p style="margin:0 0 10px">Deposits are closed while capital is deployed cross-chain. They reopen once it has all come back as NEAR, so a valuation report never sets the price you pay.</p>` : ""}
     ${emergency ? `<p class="v-bad" style="margin:0 0 10px"><b>Emergency exit mode.</b> Trading and deposits are frozen. Withdrawals still pay your exact slice of the NEAR pool and move your slice of the cross-chain wallet to you as claimable units.</p>` : ""}
     <div class="actions">
-      ${!emergency ? `<label class="field"><span>Deposit (NEAR)</span><input id="dep-amt" inputmode="decimal" placeholder="1.0" autocomplete="off"></label>
+      ${!emergency && s.deposits_open !== false ? `<label class="field"><span>Deposit (NEAR)</span><input id="dep-amt" inputmode="decimal" placeholder="1.0" autocomplete="off"></label>
       <button class="primary" data-act="deposit">Deposit</button>` : ""}
       ${p.shares > 0n ? `<label class="field"><span>Withdraw (% of your shares)</span><input id="wd-pct" inputmode="numeric" value="100"></label>
       <button data-act="withdraw">${emergency ? "Emergency withdraw" : "Withdraw"}</button>` : ""}

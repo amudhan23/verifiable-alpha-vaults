@@ -50,7 +50,7 @@ export class LiveVault {
     return {
       id: this.contractId,
       name: this.contractId,
-      manager: s.owner,
+      manager: s.manager ?? s.owner,
       live: true,
       approved_wasm_hash: s.approved_wasm_hash,
       guardrails: s.guardrails,
@@ -68,6 +68,10 @@ export class LiveVault {
       return_pct: returnPct,
       integrity_alert: s.integrity_alert,
       deposits_paused: s.deposits_paused,
+      mode: s.mode ?? null,
+      deposits_open: s.deposits_open ?? !s.deposits_paused,
+      pending_strategy: s.pending_strategy ?? null,
+      executor: s.executor,
       commitments,
       risk_proofs: proofs.map((p) => ({ ...p, bundle: JSON.parse(p.bundle_json) })),
     };
