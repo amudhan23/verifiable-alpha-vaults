@@ -15,7 +15,15 @@ sha256sum target/wasm32-wasip1/release/strategy.wasm   # <- this is approved_was
 ```
 
 ## 2. Deploy the project on OutLayer
-Install the OutLayer CLI per <https://app.outlayer.ai/docs/getting-started>, then:
+Install the CLI (`cargo install outlayer-cli`), log in once with the throwaway
+testnet key, then everything (upload, deploy, secrets, payment keys) works
+from the terminal:
+```bash
+outlayer login testnet        # paste the NEAR account + full-access key
+outlayer keys create          # payment key for the HTTPS API
+outlayer secrets set STRATEGY_PARAMS='{"fast":3,"slow":8,"threshold_bps":50,"size_bps":4000,"leverage_bps":25000}'
+```
+then:
 ```bash
 outlayer upload target/wasm32-wasip1/release/strategy.wasm   # prints sha256 + FastFS URL
 outlayer deploy alpha-vault-strategy <FastFS URL>

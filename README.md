@@ -48,6 +48,8 @@ investor ──deposit──► Vault contract (NEAR, near-sdk Rust)
                       browser verifies: attestation · commitments · range proofs
 ```
 
+- Performance fees respect an on-chain **high-water mark** (fee shares mint to the manager only on new highs), and the strategy itself is a **NEP-171 NFT**: whoever holds it earns the fees and may rotate the code (loudly — rotation is an on-chain event). Sell the NFT and the verified track record goes with it.
+
 - `crates/proofs` — Pedersen commitments + aggregated Bulletproofs proving
   `secret value ≤ public limit` (a 10x-leverage epoch **cannot produce a
   proof**); compiles to WASM for in-browser verification.

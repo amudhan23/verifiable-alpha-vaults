@@ -19,14 +19,21 @@
 //! What stays private: strategy parameters and *future* decisions. Past
 //! trades, once executed, are public by design.
 
+use near_contract_standards::non_fungible_token::metadata::{
+    NFTContractMetadata, NonFungibleTokenMetadataProvider, TokenMetadata, NFT_METADATA_SPEC,
+};
+use near_contract_standards::non_fungible_token::{NonFungibleToken, Token, TokenId};
+use near_sdk::collections::LazyOption;
 use near_sdk::json_types::U128;
 use near_sdk::store::{LookupMap, Vector};
 use near_sdk::{
-    env, near, require, AccountId, BorshStorageKey, NearToken, PanicOnDefault, Promise,
+    env, near, require, AccountId, BorshStorageKey, NearToken, PanicOnDefault, Promise, PromiseOrValue,
 };
 
 const EVENT_STANDARD: &str = "alpha-vault";
 const EVENT_VERSION: &str = "1.0.0";
+/// Scale for NAV-per-share fixed-point math.
+const NPS_SCALE: u128 = 1_000_000_000_000;
 
 #[derive(BorshStorageKey)]
 #[near(serializers = [borsh])]
@@ -35,7 +42,17 @@ enum StorageKey {
     Commitments,
     RiskProofs,
     NavLog,
+    NftOwner,
+    NftApproval,
+    NftEnumeration,
+    NftMetadata,
+    NftContractMetadata,
 }
+
+/// The vault's strategy is itself an NFT: whoever holds it earns the
+/// performance fees and may rotate the approved strategy code. Sell the NFT
+/// and the verified track record goes with it.
+pub const STRATEGY_TOKEN_ID: &str = "strategy-1";
 
 /// Risk policy enforced by the contract. The sealed strategy cannot loosen it.
 #[near(serializers = [borsh, json])]
@@ -140,9 +157,16 @@ pub struct Vault {
     commitments: Vector<TradeCommitment>,
     risk_proofs: Vector<StoredRiskProof>,
     nav_log: Vector<NavPoint>,
+    /// Performance fee on gains above the high-water mark, in bps (2000 = 20%).
+    pub perf_fee_bps: u64,
+    /// High-water mark: NAV per share, scaled by NPS_SCALE.
+    pub hwm_nav_per_share: u128,
     /// Set when an attestation with a wrong code hash shows up ("cheat 3").
     pub integrity_alert: Option<String>,
     pub deposits_paused: bool,
+    /// NEP-171: the strategy NFT (fee rights + code-rotation rights).
+    nft: NonFungibleToken,
+    nft_metadata: LazyOption<NFTContractMetadata>,
 }
 
 fn emit(event: &str, data: serde_json::Value) {
@@ -172,7 +196,41 @@ impl Vault {
         );
         require!(guardrails.max_leverage_bps <= 65_535, "limit must fit 16 bits");
         require!(guardrails.max_drawdown_bps <= 10_000, "drawdown limit > 100%");
+        let mut nft = NonFungibleToken::new(
+            StorageKey::NftOwner,
+            owner.clone(),
+            Some(StorageKey::NftMetadata),
+            Some(StorageKey::NftEnumeration),
+            Some(StorageKey::NftApproval),
+        );
+        // mint without a storage-deposit refund: the deployer's account
+        // balance covers the one-time storage for the single strategy token
+        nft.internal_mint_with_refund(
+            STRATEGY_TOKEN_ID.to_string(),
+            owner.clone(),
+            Some(TokenMetadata {
+                title: Some("Alpha Vault Strategy #1".into()),
+                description: Some(format!(
+                    "Sealed-parameter strategy attested as wasm {}. Holder earns performance fees and may rotate the approved code (rotation is logged on-chain).",
+                    approved_wasm_hash
+                )),
+                media: None, media_hash: None, copies: Some(1), issued_at: None,
+                expires_at: None, starts_at: None, updated_at: None, extra: None,
+                reference: None, reference_hash: None,
+            }),
+            None,
+        );
         Self {
+            nft,
+            nft_metadata: LazyOption::new(
+                StorageKey::NftContractMetadata,
+                Some(&NFTContractMetadata {
+                    spec: NFT_METADATA_SPEC.to_string(),
+                    name: "Verifiable Alpha Vault Strategies".to_string(),
+                    symbol: "VAVS".to_string(),
+                    icon: None, base_uri: None, reference: None, reference_hash: None,
+                }),
+            ),
             owner,
             executor,
             approved_wasm_hash,
@@ -183,6 +241,8 @@ impl Vault {
             commitments: Vector::new(StorageKey::Commitments),
             risk_proofs: Vector::new(StorageKey::RiskProofs),
             nav_log: Vector::new(StorageKey::NavLog),
+            perf_fee_bps: 2_000,
+            hwm_nav_per_share: NPS_SCALE, // 1.0
             integrity_alert: None,
             deposits_paused: false,
         }
@@ -198,6 +258,7 @@ impl Vault {
         require!(!self.deposits_paused, "deposits are paused (integrity alert)");
         let amount = env::attached_deposit().as_yoctonear();
         require!(amount > 0, "attach a deposit");
+        self.crystallize_fees();
         let minted = if self.total_shares == 0 || self.pool == 0 {
             amount
         } else {
@@ -221,7 +282,8 @@ impl Vault {
     /// Burn shares, withdraw the pro-rata slice of the pool.
     pub fn withdraw(&mut self, shares: U128) -> Promise {
         let who = env::predecessor_account_id();
-        let have = self.shares.get(&who).copied().unwrap_or(0);
+        self.crystallize_fees();
+        let have = self.shares.get(&who).copied().unwrap_or(0); // re-read: fee mint may have run
         let burn = shares.0;
         require!(burn > 0 && burn <= have, "not enough shares");
         let amount = (self.pool.saturating_mul(burn)) / self.total_shares;
@@ -391,9 +453,13 @@ impl Vault {
     // ------------------------------------------------------------------
 
     /// Rotating the strategy is allowed but *loud*: it clears nothing and is
-    /// logged, so the leaderboard shows a code change.
+    /// logged, so the leaderboard shows a code change. Right belongs to the
+    /// strategy-NFT holder.
     pub fn approve_new_wasm_hash(&mut self, wasm_hash: String) {
-        require!(env::predecessor_account_id() == self.owner, "owner only");
+        require!(
+            env::predecessor_account_id() == self.manager_account(),
+            "only the strategy-NFT holder may rotate the code"
+        );
         require!(
             wasm_hash.len() == 64 && hex::decode(&wasm_hash).is_ok(),
             "wasm_hash must be 32 bytes hex"
@@ -472,6 +538,63 @@ impl Vault {
 
     // ------------------------------------------------------------------
 
+    /// Mint the manager's performance fee as shares for any gain above the
+    /// high-water mark, then raise the mark. Callable by anyone; also runs
+    /// automatically before every deposit and withdrawal, so fees can never
+    /// be charged twice for the same gain.
+    pub fn crystallize_fees(&mut self) -> U128 {
+        if self.total_shares == 0 || self.pool == 0 || self.perf_fee_bps == 0 {
+            return U128(0);
+        }
+        let nps = self.pool.saturating_mul(NPS_SCALE) / self.total_shares;
+        if nps <= self.hwm_nav_per_share {
+            return U128(0);
+        }
+        // fee value = fee_bps of the gain since the mark, over all shares
+        let gain_per_share = nps - self.hwm_nav_per_share;
+        let fee_value = gain_per_share.saturating_mul(self.total_shares) / NPS_SCALE
+            * u128::from(self.perf_fee_bps)
+            / 10_000;
+        if fee_value == 0 {
+            self.hwm_nav_per_share = nps;
+            return U128(0);
+        }
+        // mint shares that dilute everyone by exactly fee_value:
+        // fee_shares = total * f/(1-f), f = fee_value/pool  (fixed point)
+        let f = fee_value.saturating_mul(NPS_SCALE) / self.pool;
+        let fee_shares = self.total_shares.saturating_mul(f) / (NPS_SCALE - f);
+        if fee_shares > 0 {
+            let manager = self.manager_account();
+            let cur = self.shares.get(&manager).copied().unwrap_or(0);
+            self.shares.insert(manager.clone(), cur + fee_shares);
+            self.total_shares += fee_shares;
+            emit(
+                "fees_crystallized",
+                serde_json::json!({
+                    "manager": manager,
+                    "fee_shares": fee_shares.to_string(),
+                    "fee_value_yocto": fee_value.to_string(),
+                }),
+            );
+        }
+        // the mark moves to the new NAV/share (post-dilution)
+        self.hwm_nav_per_share = self.pool.saturating_mul(NPS_SCALE) / self.total_shares;
+        U128(fee_shares)
+    }
+
+    /// Who earns fees and may rotate the strategy: the strategy-NFT holder.
+    fn manager_account(&self) -> AccountId {
+        self.nft
+            .owner_by_id
+            .get(&STRATEGY_TOKEN_ID.to_string())
+            .unwrap_or_else(|| self.owner.clone())
+    }
+
+    /// Public view of the current manager (= NFT holder).
+    pub fn get_manager(&self) -> AccountId {
+        self.manager_account()
+    }
+
     fn record_nav(&mut self) {
         self.nav_log.push(NavPoint {
             ts_ms: env::block_timestamp_ms(),
@@ -509,6 +632,17 @@ impl Vault {
             return Err(format!("pair '{}' not in allowlist", d.pair));
         }
         Ok(())
+    }
+}
+
+near_contract_standards::impl_non_fungible_token_core!(Vault, nft);
+near_contract_standards::impl_non_fungible_token_approval!(Vault, nft);
+near_contract_standards::impl_non_fungible_token_enumeration!(Vault, nft);
+
+#[near]
+impl NonFungibleTokenMetadataProvider for Vault {
+    fn nft_metadata(&self) -> NFTContractMetadata {
+        self.nft_metadata.get().unwrap()
     }
 }
 
@@ -575,17 +709,81 @@ mod tests {
         assert_eq!(v.total_shares, 400);
         assert_eq!(v.pool, 400);
 
-        // vault gains 100 PnL -> pool 500; alice's 100 shares worth 125
+        // vault gains 100 PnL -> pool 500. On withdraw, the 20% performance
+        // fee on the gain crystallizes first (manager is diluted in, ~16
+        // shares worth ~20), then alice exits at the post-fee NAV/share.
         v.pool += 100;
         ctx(investor(), 0);
         let _ = v.withdraw(U128(100));
-        assert_eq!(v.pool, 375);
-        assert_eq!(v.total_shares, 300);
         assert_eq!(v.get_shares(investor()).0, 0);
+        // owner holds their 300 deposit shares + ~16 fee shares; alice exited
+        // with ~120 (125 pre-fee minus her slice of the 20-yocto fee)
+        let manager_shares = v.get_shares(owner()).0;
+        assert!((315..=317).contains(&manager_shares), "300 deposit + ~16 fee shares, got {manager_shares}");
+        assert!((379..=381).contains(&v.pool), "pool after alice's ~120 exit, got {}", v.pool);
         // every pool change is in the public NAV log
         let hist = v.get_nav_history(0, 10);
         assert_eq!(hist.len(), 3);
-        assert_eq!(hist[2]["pool_yocto"], "375");
+    }
+
+    #[test]
+    fn strategy_nft_carries_manager_rights() {
+        let mut v = new_vault();
+        let bob: AccountId = "bob.testnet".parse().unwrap();
+        assert_eq!(v.get_manager(), owner());
+        assert_eq!(v.nft_token(STRATEGY_TOKEN_ID.into()).unwrap().owner_id, owner());
+
+        // alice invests; the vault gains; nobody crystallizes yet
+        ctx(investor(), 1_000_000);
+        v.deposit();
+        v.pool += 500_000;
+
+        // the manager sells the strategy NFT to bob (1 yocto per NEP-171)
+        ctx(owner(), 1);
+        v.nft_transfer(bob.clone(), STRATEGY_TOKEN_ID.into(), None, None);
+        assert_eq!(v.get_manager(), bob);
+
+        // fees now crystallize to bob, not the original owner
+        ctx(bob.clone(), 0);
+        assert!(v.crystallize_fees().0 > 0);
+        assert!(v.get_shares(bob.clone()).0 > 0);
+        assert_eq!(v.get_shares(owner()).0, 0);
+
+        // code rotation now belongs to bob...
+        ctx(bob.clone(), 0);
+        v.approve_new_wasm_hash("ab".repeat(32));
+        assert_eq!(v.approved_wasm_hash, "ab".repeat(32));
+
+        // ...and the old owner lost it
+        ctx(owner(), 0);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            v.approve_new_wasm_hash("cd".repeat(32))
+        }));
+        assert!(res.is_err(), "previous owner must not rotate the code");
+    }
+
+    #[test]
+    fn performance_fee_respects_the_high_water_mark() {
+        let mut v = new_vault();
+        ctx(investor(), 1_000_000);
+        v.deposit();
+        // +50% gain -> fee = 20% of 500_000 = ~100_000 in value
+        v.pool += 500_000;
+        ctx(owner(), 0);
+        let minted = v.crystallize_fees().0;
+        assert!(minted > 0);
+        let manager_value = v.pool * v.get_shares(owner()).0 / v.total_shares;
+        assert!((99_000..=100_500).contains(&manager_value), "got {manager_value}");
+        // same NAV: crystallizing again charges nothing
+        assert_eq!(v.crystallize_fees().0, 0);
+        // drawdown below the mark, then partial recovery: still nothing
+        v.pool -= 300_000;
+        assert_eq!(v.crystallize_fees().0, 0);
+        v.pool += 200_000;
+        assert_eq!(v.crystallize_fees().0, 0, "no fee until the old mark is beaten");
+        // new high: fee only on the gain above the previous mark
+        v.pool += 250_000;
+        assert!(v.crystallize_fees().0 > 0);
     }
 
     #[test]
