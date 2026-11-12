@@ -26,6 +26,10 @@ Four seals, four independent checks against public data. None trust our server:
 
 Execution is a real Uniswap v3 swap through NEAR Chain Signatures (the commitment rides in the swap's calldata). Cross-chain PnL settles back into NAV through the enclave. Returns are NAV **per share**. Details and every tx: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
+### Use it
+
+Open a live vault page, **Connect wallet** (Meteor, MyNearWallet or Intear on NEAR testnet), and deposit or withdraw. Each action is a transaction you sign in your own wallet. If the vault ever goes silent past its liveness timeout, the same panel offers **Trigger emergency exit** and **Claim recovered funds**.
+
 ### What is protected — and what is not
 
 > **The protected asset is the strategy's parameters and its future

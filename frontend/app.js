@@ -5,6 +5,7 @@
 //   ?vault=<contract>[&rpc=url]  — live NEAR testnet state, pinned above demo rows
 import { runAllChecks, checkCodeAttested, checkCommitment } from "./verify.js";
 import { LiveVault } from "./near-rpc.mjs";
+import * as W from "./wallet.mjs";
 
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) =>
@@ -207,6 +208,7 @@ async function renderVault(id) {
     </div>
     <p class="certline">This page certifies that every decision below was committed on NEAR before it executed anywhere, attested by Intel TDX to the approved code, computed from real market prices, and bounded by the stated guardrails — or shows you exactly where that failed.</p>
     <div class="stamp-row" id="stamps" aria-live="polite"></div>
+    ${v.live ? `<div class="panel position" id="position"><h3>Your position</h3><p class="muted">Loading wallet…</p></div>` : ""}
     ${v.emergency ? `<div class="alert"><b>Emergency exit mode.</b> No attested decision for over ${Math.round(v.liveness_timeout_ms / 3.6e6)}h. Trading is frozen; withdrawals pay your share of the local pool now and record a claim on cross-chain value.</div>` : ""}
     ${v.integrity_alert ? `<div class="alert"><b>Integrity alert — deposits paused.</b> A decision arrived attested to different code: <code>${esc(v.integrity_alert)}</code></div>` : ""}
     <div class="cols">
@@ -242,6 +244,88 @@ async function renderVault(id) {
       <div class="check-row"><span class="what">Real prices: each published enclave input hashes to its attested input, and its oracle price matches public market history</span><span class="result muted" id="r-prices">not run</span></div>
     </div>`;
 }
+
+// ------------------------------------------------------------ your position
+async function mountPosition(v) {
+  const box = $("#position");
+  if (!box) return;
+  try {
+    await W.ensureWallet(v.id);
+  } catch (e) {
+    box.innerHTML = `<h3>Your position</h3><p class="muted">Wallet unavailable: ${esc(e.message)}</p>`;
+    return;
+  }
+  await renderPosition(v);
+}
+
+async function renderPosition(v) {
+  const box = $("#position");
+  if (!box) return;
+  const acct = W.currentAccount();
+  if (!acct) {
+    box.innerHTML = `<h3>Your position</h3>
+      <p style="margin:0 0 12px">Connect a NEAR <b>testnet</b> wallet to deposit, see your shares, and withdraw.</p>
+      <button class="primary" data-act="connect">Connect wallet</button>`;
+    return;
+  }
+  box.innerHTML = `<h3>Your position</h3><p class="muted">Reading ${esc(acct)}…</p>`;
+  const p = await W.position(v.id, acct);
+  const s = p.summary;
+  const emergency = s.emergency, stale = s.stale;
+  const claim = p.claim && BigInt(p.claim.claim_yocto) > 0n ? p.claim : null;
+  box.innerHTML = `<h3>Your position · ${esc(acct)}</h3>
+    <dl class="kv" style="margin-bottom:14px">
+      <dt>shares</dt><dd>${W.yoctoToNear(p.shares.toString())}</dd>
+      <dt>worth now</dt><dd>${W.yoctoToNear(p.value.toString())} NEAR</dd>
+      ${claim ? `<dt>cross-chain claim</dt><dd>${W.yoctoToNear(claim.claim_yocto)} NEAR (paid ${W.yoctoToNear(claim.paid_yocto)})</dd>` : ""}
+    </dl>
+    ${emergency ? `<p class="v-bad" style="margin:0 0 10px"><b>Emergency exit mode.</b> Withdrawing pays your share of the NEAR pool now and records a claim on cross-chain value.</p>` : ""}
+    <div class="actions">
+      ${!emergency ? `<label class="field"><span>Deposit (NEAR)</span><input id="dep-amt" inputmode="decimal" placeholder="1.0" autocomplete="off"></label>
+      <button class="primary" data-act="deposit">Deposit</button>` : ""}
+      ${p.shares > 0n ? `<label class="field"><span>Withdraw (% of your shares)</span><input id="wd-pct" inputmode="numeric" value="100"></label>
+      <button data-act="withdraw">${emergency ? "Emergency withdraw" : "Withdraw"}</button>` : ""}
+      ${claim ? `<button data-act="claim">Claim recovered funds</button>` : ""}
+      ${stale && !emergency ? `<button data-act="emergency" title="The vault has been silent past its liveness timeout">Trigger emergency exit</button>` : ""}
+    </div>
+    <p class="muted" id="pos-msg" role="status" style="font-size:12.5px; margin:10px 0 0">${!emergency && p.shares > 0n && p.value > p.local ? "Part of the NAV sits cross-chain; a full withdrawal may wait for the next settlement." : "Each action is a transaction you sign in your own wallet."}</p>
+    <p style="margin:6px 0 0; font-size:12.5px"><a href="#" data-act="disconnect">Sign out</a></p>`;
+}
+
+async function onPositionAction(act) {
+  const v = CURRENT_VAULT;
+  const msg = (t, cls = "muted") => { const el = $("#pos-msg"); if (el) { el.className = cls; el.textContent = t; } };
+  try {
+    if (act === "connect") return W.connect(v.id);
+    if (act === "disconnect") { await W.disconnect(); return renderPosition(v); }
+    msg("Waiting for your wallet…");
+    if (act === "deposit") {
+      const amt = $("#dep-amt").value;
+      W.nearToYocto(amt); // validates
+      if (Number(amt) <= 0) throw new Error("enter an amount above 0");
+      await W.deposit(amt);
+    } else if (act === "withdraw") {
+      const pct = BigInt(Math.max(1, Math.min(100, parseInt($("#wd-pct").value, 10) || 0)));
+      const p = await W.position(v.id, W.currentAccount());
+      const shares = (p.shares * pct) / 100n;
+      if (shares === 0n) throw new Error("no shares to withdraw");
+      await W.withdrawShares(shares);
+    } else if (act === "emergency") {
+      await W.triggerEmergency();
+    } else if (act === "claim") {
+      await W.claimRecovered();
+    }
+    msg("Done. Refreshing…", "v-ok");
+    DATA = null; // re-read chain state
+    await renderVault(v.id);
+    if (CURRENT_VAULT?.live) await renderPosition(CURRENT_VAULT);
+  } catch (e) {
+    const m = String(e?.message ?? e);
+    msg(m.includes("User rejected") || m.includes("cancel") ? "Cancelled in your wallet." : `Failed: ${m.replace(/^.*Smart contract panicked: /, "")}`, "v-bad");
+  }
+}
+
+W.onWalletChange(() => { if (CURRENT_VAULT?.live) renderPosition(CURRENT_VAULT); });
 
 async function onRunChecks() {
   const v = CURRENT_VAULT;
@@ -377,6 +461,8 @@ document.addEventListener("click", async (e) => {
     return;
   }
 
+  const act = e.target.closest("[data-act]");
+  if (act) { e.preventDefault(); return onPositionAction(act.dataset.act); }
   if (e.target.closest("#run-checks")) return onRunChecks();
   const cheatBtn = e.target.closest("[data-cheat]");
   if (cheatBtn) return onCheat(cheatBtn.dataset.cheat);
@@ -393,7 +479,10 @@ document.addEventListener("keydown", (e) => {
 async function route() {
   const h = location.hash || "#/";
   CURRENT_VAULT = null;
-  if (h.startsWith("#/vault/")) await renderVault(decodeURIComponent(h.slice(8)));
+  if (h.startsWith("#/vault/")) {
+    await renderVault(decodeURIComponent(h.slice(8)));
+    if (CURRENT_VAULT?.live) mountPosition(CURRENT_VAULT);
+  }
   else if (h === "#/redteam") await renderRedTeam();
   else await renderLeaderboard();
   $("#page-h")?.focus({ preventScroll: true });

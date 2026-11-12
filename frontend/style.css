@@ -314,3 +314,15 @@ footer {
   .sheet { padding: 26px 14px 34px; }
   .sheet::before, .sheet::after, .corner-b::before, .corner-b::after { width: 46px; height: 46px; }
 }
+
+/* ——— your position ——— */
+.position { margin: 0 0 20px; max-width: 640px; }
+.position .actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+.field { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--ink-2); font-style: italic; }
+.field input {
+  font: 14px var(--mono); color: var(--ink);
+  background: var(--paper-2); border: 1px solid var(--ink); border-radius: 2px;
+  padding: 7px 10px; width: 150px;
+}
+.field input:focus-visible { outline: 2px solid var(--verified); outline-offset: 1px; }
+
