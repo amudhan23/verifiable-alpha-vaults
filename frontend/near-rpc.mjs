@@ -35,10 +35,17 @@ export class LiveVault {
   /** Normalize on-chain state into the same shape the demo fixtures use. */
   async load() {
     const s = await this.view("get_summary");
-    const [commitments, proofs] = await Promise.all([
+    const [commitments, proofs, navLog] = await Promise.all([
       this.view("get_commitments", { from: 0, limit: 500 }),
       this.view("get_risk_proofs", { from: 0, limit: 200 }),
+      this.view("get_nav_history", { from: 0, limit: 1000 }).catch(() => []),
     ]);
+    const toNear = (yocto) => Number(BigInt(yocto) / 10n ** 20n) / 10_000;
+    const navHistory = navLog.map((p) => ({ t: p.t, nav: toNear(p.pool_yocto) }));
+    const returnPct =
+      navHistory.length >= 2 && navHistory[0].nav > 0
+        ? ((navHistory.at(-1).nav / navHistory[0].nav) - 1) * 100
+        : null;
     return {
       id: this.contractId,
       name: this.contractId.split(".")[0],
@@ -46,10 +53,10 @@ export class LiveVault {
       live: true,
       approved_wasm_hash: s.approved_wasm_hash,
       guardrails: s.guardrails,
-      pool_near: Number(BigInt(s.pool_yocto) / 10n ** 20n) / 10_000, // 4dp NEAR
+      pool_near: toNear(s.pool_yocto),
       total_shares: s.total_shares,
-      nav_history: [], // charted once epochs accrue; see render fallback
-      return_pct: null,
+      nav_history: navHistory,
+      return_pct: returnPct,
       integrity_alert: s.integrity_alert,
       deposits_paused: s.deposits_paused,
       commitments,

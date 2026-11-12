@@ -108,12 +108,13 @@ async function renderLeaderboard() {
       const revealed = v.commitments.filter((c) => c.revealed).length;
       const proofs = v.risk_proofs.length;
       const rejected = v.commitments.filter((c) => c.status === "Rejected").length;
+      const codeLabel = { ok: "code attested", bad: "code mismatch", wait: "code unchecked" }[code.state];
       return `<a class="ledger-row" href="#/vault/${encodeURIComponent(v.id)}">
         <span class="vault-name">${esc(v.name)}${v.live ? ` <span class="chip ok" style="margin-left:6px"><span class="dot"></span>live</span>` : ""}<small>${esc(v.id)}</small></span>
         <span class="spark-cell">${sparkline(v.nav_history)}</span>
-        <span class="ret ${v.return_pct == null ? "muted" : v.return_pct >= 0 ? "v-ok" : "v-bad"}">${fmtPct(v.return_pct)}</span>
+        <span class="ret ${v.return_pct == null || Math.abs(v.return_pct) < 0.005 ? "muted" : v.return_pct >= 0 ? "v-ok" : "v-bad"}">${fmtPct(v.return_pct)}</span>
         <span class="badges">
-          ${chip(code.state, "code attested")}
+          ${chip(code.state, codeLabel)}
           ${chip(revealed ? "ok" : "wait", `${revealed} trades committed`)}
           ${chip(proofs ? "ok" : rejected ? "bad" : "wait", proofs ? `${proofs} risk proofs` : rejected ? `${rejected} breaches blocked` : "no proofs")}
         </span>
@@ -153,7 +154,7 @@ async function renderVault(id) {
       return `<tr class="expandable" data-id="${c.id}" tabindex="0" role="button" aria-expanded="false">
         <td class="num">#${c.id}</td>
         <td><span class="hash">${short(c.commitment)}</span></td>
-        <td>${d ? `${esc(d.action)} ${esc(d.pair)} <span class="muted">(${(d.leverage_bps / 10000).toFixed(1)}x, ${(d.size_bps / 100).toFixed(0)}% NAV)</span>` : `<span class="muted">sealed until execution</span>`}</td>
+        <td>${d ? (d.action === "hold" ? `<span class="muted">hold</span>` : `${esc(d.action)} ${esc(d.pair)} <span class="muted">(${(d.leverage_bps / 10000).toFixed(1)}x, ${(d.size_bps / 100).toFixed(0)}% NAV)</span>`) : `<span class="muted">sealed until execution</span>`}</td>
         <td>${stateChip}</td>
         <td class="num muted">${when(c.committed_at_ms)}</td>
       </tr>
@@ -179,9 +180,9 @@ async function renderVault(id) {
         <div class="sub">${esc(v.id)} · strategy ${short(v.approved_wasm_hash)} ${copyBtn(v.approved_wasm_hash)}</div>
       </div>
       <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
-        <span id="b-code">${chip("wait", "code attested")}</span>
-        <span id="b-trades">${chip("wait", "trades committed")}</span>
-        <span id="b-risk">${chip("wait", "risk proven")}</span>
+        <span id="b-code">${chip("wait", "code unchecked")}</span>
+        <span id="b-trades">${chip("wait", "trades unchecked")}</span>
+        <span id="b-risk">${chip("wait", "risk unchecked")}</span>
         <button class="primary" id="run-checks">Run all checks</button>
       </div>
     </div>
@@ -224,10 +225,14 @@ async function onRunChecks() {
     if (el) el.innerHTML = `<span class="${{ ok: "v-ok", bad: "v-bad", wait: "v-wait" }[r.state]}">${{ ok: "✓", bad: "✗", wait: "–" }[r.state]} ${esc(r.detail)}</span>`;
   };
   ["#b-code", "#b-trades", "#b-risk"].forEach((s) => { const el = $(s); if (el) el.innerHTML = `<span class="chip running"><span class="dot"></span>checking…</span>`; });
+  const label = (names) => (r) => names[r.state];
+  const codeL = label({ ok: "code attested", bad: "code mismatch", wait: "code unchecked" });
+  const tradesL = label({ ok: "trades committed", bad: "back-fill detected", wait: "trades unchecked" });
+  const riskL = label({ ok: "risk proven", bad: "risk breach", wait: "risk unproven" });
   await runAllChecks(v, {
-    onCode: (r) => { setChip("#b-code", r.state, "code attested"); setRes("#r-code", r); },
-    onTrades: (r) => { setChip("#b-trades", r.state, "trades committed"); setRes("#r-trades", r); },
-    onRisk: (r) => { setChip("#b-risk", r.state, "risk proven"); setRes("#r-risk", r); },
+    onCode: (r) => { setChip("#b-code", r.state, codeL(r)); setRes("#r-code", r); },
+    onTrades: (r) => { setChip("#b-trades", r.state, tradesL(r)); setRes("#r-trades", r); },
+    onRisk: (r) => { setChip("#b-risk", r.state, riskL(r)); setRes("#r-risk", r); },
     onTradeStep: (id) => { const el = $("#r-trades"); if (el) el.textContent = `recomputing #${id}…`; },
     onRiskStep: (ep) => { const el = $("#r-risk"); if (el) el.textContent = `verifying epoch ${ep}…`; },
   });

@@ -11,7 +11,7 @@ use vault_proofs::{prove_risk, RiskLimits};
 use vault_strategy::{run, Params, RunInput};
 
 const WASM_HASH: &str = "c3b8b92a101e575d1c0e2e502c1fc21443fa0e08e864e84fe467d5840bda9f77";
-const T0_MS: u64 = 1_762_992_000_000; // Thu 13 Nov 2026 00:00 UTC
+const T0_MS: u64 = 1794268800000; // Tue 10 Nov 2026 00:00 UTC
 const EPOCH_MS: u64 = 3_600_000; // hourly epochs
 
 /// Tiny deterministic LCG so fixtures are reproducible without a rand dep.

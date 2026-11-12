@@ -34,6 +34,7 @@ enum StorageKey {
     Shares,
     Commitments,
     RiskProofs,
+    NavLog,
 }
 
 /// Risk policy enforced by the contract. The sealed strategy cannot loosen it.
@@ -114,6 +115,13 @@ pub struct StoredRiskProof {
     pub posted_at_ms: u64,
 }
 
+/// One point of public NAV history (pool size after a change).
+#[near(serializers = [borsh])]
+pub struct NavPoint {
+    pub ts_ms: u64,
+    pub pool_yocto: u128,
+}
+
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct Vault {
@@ -131,6 +139,7 @@ pub struct Vault {
     pub pool: u128,
     commitments: Vector<TradeCommitment>,
     risk_proofs: Vector<StoredRiskProof>,
+    nav_log: Vector<NavPoint>,
     /// Set when an attestation with a wrong code hash shows up ("cheat 3").
     pub integrity_alert: Option<String>,
     pub deposits_paused: bool,
@@ -173,6 +182,7 @@ impl Vault {
             pool: 0,
             commitments: Vector::new(StorageKey::Commitments),
             risk_proofs: Vector::new(StorageKey::RiskProofs),
+            nav_log: Vector::new(StorageKey::NavLog),
             integrity_alert: None,
             deposits_paused: false,
         }
@@ -200,6 +210,7 @@ impl Vault {
         self.shares.insert(who.clone(), cur + minted);
         self.total_shares += minted;
         self.pool += amount;
+        self.record_nav();
         emit(
             "deposit",
             serde_json::json!({"account": who, "amount": amount.to_string(), "shares": minted.to_string()}),
@@ -217,6 +228,7 @@ impl Vault {
         self.shares.insert(who.clone(), have - burn);
         self.total_shares -= burn;
         self.pool -= amount;
+        self.record_nav();
         emit(
             "withdraw",
             serde_json::json!({"account": who, "amount": amount.to_string(), "shares": burn.to_string()}),
@@ -434,6 +446,15 @@ impl Vault {
             .collect()
     }
 
+    /// Public NAV history: every pool change, timestamped. This is what the
+    /// leaderboard charts and what returns are computed from.
+    pub fn get_nav_history(&self, from: u64, limit: u64) -> Vec<serde_json::Value> {
+        (from..(from + limit).min(self.nav_log.len() as u64))
+            .filter_map(|i| self.nav_log.get(i as u32))
+            .map(|p| serde_json::json!({"t": p.ts_ms, "pool_yocto": p.pool_yocto.to_string()}))
+            .collect()
+    }
+
     /// Everything a third party needs to verify this vault independently.
     pub fn get_verification_info(&self) -> serde_json::Value {
         serde_json::json!({
@@ -450,6 +471,13 @@ impl Vault {
     }
 
     // ------------------------------------------------------------------
+
+    fn record_nav(&mut self) {
+        self.nav_log.push(NavPoint {
+            ts_ms: env::block_timestamp_ms(),
+            pool_yocto: self.pool,
+        });
+    }
 
     fn assert_executor(&self) {
         require!(
@@ -554,6 +582,10 @@ mod tests {
         assert_eq!(v.pool, 375);
         assert_eq!(v.total_shares, 300);
         assert_eq!(v.get_shares(investor()).0, 0);
+        // every pool change is in the public NAV log
+        let hist = v.get_nav_history(0, 10);
+        assert_eq!(hist.len(), 3);
+        assert_eq!(hist[2]["pool_yocto"], "375");
     }
 
     #[test]

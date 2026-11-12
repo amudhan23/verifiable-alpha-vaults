@@ -1,0 +1,50 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Rust tests (proofs, contract, strategy, full pipeline)
+        run: cargo test --workspace
+      - name: Executor tests (offline, incl. full local-enclave cycle)
+        run: node executor/test.mjs
+      - name: One full offline cycle (enclave -> commit -> reveal -> proof)
+        run: node executor/run.mjs --enclave local --vault dry
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Add wasm targets
+        run: rustup target add wasm32-unknown-unknown wasm32-wasip1
+      - name: Vault contract (NEAR deployable)
+        run: cargo build -p vault-contract --target wasm32-unknown-unknown --release
+      - name: Strategy (OutLayer enclave binary) + approved hash
+        run: |
+          cargo build -p vault-strategy --target wasm32-wasip1 --release
+          sha256sum target/wasm32-wasip1/release/strategy.wasm | tee strategy.wasm.sha256
+      - name: Browser proof verifier (Bulletproofs in the browser)
+        run: |
+          cargo build -p vault-proofs --target wasm32-unknown-unknown --release --features wasm
+          curl -sSL https://github.com/rustwasm/wasm-bindgen/releases/download/0.2.130/wasm-bindgen-0.2.130-x86_64-unknown-linux-musl.tar.gz | tar xz
+          ./wasm-bindgen-0.2.130-x86_64-unknown-linux-musl/wasm-bindgen \
+            target/wasm32-unknown-unknown/release/vault_proofs.wasm \
+            --out-dir frontend/pkg --target web --no-typescript
+          ls -la frontend/pkg
+      - name: Verifier smoke test (node runs the wasm against real fixtures)
+        run: node scripts/verify-pkg-smoke.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-artifacts
+          path: |
+            target/wasm32-unknown-unknown/release/vault_contract.wasm
+            target/wasm32-wasip1/release/strategy.wasm
+            strategy.wasm.sha256
+            frontend/pkg/
