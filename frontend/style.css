@@ -161,3 +161,16 @@ footer { margin-top: 48px; color: var(--muted); font-size: 12.5px; max-width: 72
   .ledger-row .spark-cell { grid-area: spark; }
   .ledger-row .badges { grid-area: badges; justify-content: flex-start; }
 }
+
+/* copy affordance */
+button.copy {
+  font: 400 10.5px var(--mono);
+  padding: 1px 7px;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  vertical-align: 1px;
+}
+button.copy:hover { color: var(--text); }
+h2:focus, h2:focus-visible { outline: none; }

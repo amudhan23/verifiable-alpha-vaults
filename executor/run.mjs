@@ -17,6 +17,7 @@
 
 import { LocalEnclave, OutLayerEnclave } from "./enclave.mjs";
 import { NearVault, DryRunVault } from "./vault.mjs";
+import { ChainSigExecutor } from "./evm.mjs";
 
 const arg = (name, dflt) => {
   const i = process.argv.indexOf(`--${name}`);
@@ -83,17 +84,30 @@ const id = await vault.commitDecision(output.commitment, APPROVED_WASM_HASH, att
 console.log(`  committed as #${id}`);
 
 const decision = JSON.parse(output.sealed.decision_json);
+let executionRef = null;
 if (decision.action === "hold") {
   console.log("→ decision is hold; revealing without execution");
+} else if (arg("execute", "sim") === "evm") {
+  // Chain Signatures: the vault's NEAR account signs via the MPC network and
+  // the trade lands on Sepolia with the commitment hash in calldata.
+  const signer = new ChainSigExecutor({
+    accountId: need("NEAR_ACCOUNT_ID"),
+    privateKey: need("NEAR_PRIVATE_KEY"),
+  });
+  console.log(`→ execute via Chain Signatures from ${await signer.address()}`);
+  executionRef = await signer.executeTrade({ commitment: output.commitment, decision });
+  console.log(`  broadcast ✓ ${executionRef}`);
 } else {
-  // Chain Signatures leg (v1.signer-prod.testnet -> EVM testnet swap) goes
-  // here; the vault only marks Executed after its guardrail check passes.
-  console.log(`→ execute: ${decision.action} ${decision.pair} (${decision.leverage_bps / 10000}x, ${decision.size_bps / 100}% NAV) [simulated fill in demo]`);
+  console.log(`→ execute: ${decision.action} ${decision.pair} (${decision.leverage_bps / 10000}x, ${decision.size_bps / 100}% NAV) [simulated fill — pass --execute evm for Chain Signatures]`);
 }
 
 console.log("→ reveal on vault (guardrails enforced by the contract now)");
 await vault.executeDecision(id, output.sealed.decision_json, output.sealed.salt_hex);
 console.log("  revealed ✓ (hash matched, guardrails passed)");
+if (executionRef) {
+  await vault.recordExecutionRef(id, executionRef);
+  console.log("  target-chain tx recorded on the vault");
+}
 
 if (output.risk_bundle) {
   console.log("→ post Bulletproof risk bundle");
