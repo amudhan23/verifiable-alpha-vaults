@@ -19,6 +19,9 @@ export class OutLayerEnclave {
     this.project = cfg.project;
     this.key = cfg.paymentKey;
     this.profile = cfg.secretsProfile ?? "default";
+    // Pin the exact build the vault approves (OutLayer `version_key`), so a
+    // project-level "active version" change cannot swap the code under us.
+    this.versionKey = cfg.versionKey ?? null;
   }
 
   /** @param {object} input @returns {Promise<{output: RunOutput, attestationRef: string, callId: string, timeMs: number}>} */
@@ -30,6 +33,7 @@ export class OutLayerEnclave {
         input,
         secrets_ref: { profile: this.profile, account_id: this.owner },
         async: false,
+        ...(this.versionKey ? { version_key: this.versionKey } : {}),
       }),
     });
     const body = await res.json();

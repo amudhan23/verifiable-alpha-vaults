@@ -101,6 +101,7 @@ async function cycle() {
     } } : {}),
   };
 
+  if (summary?.approved_wasm_hash && "versionKey" in enclave) enclave.versionKey = summary.approved_wasm_hash;
   console.log(`→ enclave run (epoch ${epoch})`);
   const { output, attestationRef, callId, timeMs, executedWasm } = await enclave.run(input);
   const wasmForVault = executedWasm ?? APPROVED_WASM_HASH; // local sim has no attestation

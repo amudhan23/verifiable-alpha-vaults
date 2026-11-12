@@ -71,6 +71,11 @@ pub struct RunInput {
     /// NAV/peak to flatter the risk proof.
     #[serde(default)]
     pub vault_state: Option<VaultState>,
+    /// On-chain (yield/resume) delivery caps output at 900 bytes: emit the
+    /// risk bundle's sha256 instead of the bundle (posted separately and
+    /// checked against this hash by the contract).
+    #[serde(default)]
+    pub compact: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -150,6 +155,48 @@ pub struct Decision {
     pub leverage_bps: u64,
     pub epoch: u64,
     pub nonce: u64,
+    /// Trade parameters decided INSIDE the enclave (sell: wei of ETH; buy:
+    /// USDC 6dp) and the slippage floor in the output token. The vault signs
+    /// exactly these; the executor cannot change amounts or the floor.
+    #[serde(default)]
+    pub amount_in: String,
+    #[serde(default)]
+    pub min_out: String,
+    #[serde(default)]
+    pub fee_tier: u32,
+}
+
+/// ETH kept back for gas on the vault's EVM wallet.
+pub const GAS_RESERVE_WEI: u128 = 10_000_000_000_000_000; // 0.01 ETH
+pub const SLIPPAGE_BPS: u128 = 200; // 2%
+pub const FEE_TIER: u32 = 3000;
+
+/// Fill amount_in / min_out from real holdings and oracle prices.
+pub fn size_trade(d: &mut Decision, st: &SettleInput) {
+    if d.action == "hold" || !prices_ok(st) {
+        return;
+    }
+    let size = d.size_bps as u128;
+    if d.action == "sell" {
+        let eth: u128 = st.eth_balance_wei.parse().unwrap_or(0);
+        let spendable = eth.saturating_sub(GAS_RESERVE_WEI);
+        let amt = (eth * size / 10_000).min(spendable);
+        if amt == 0 { return; }
+        // USDC out at oracle price, minus slippage
+        let usdc = (amt as f64 / 1e18) * st.eth_usd * 1e6;
+        let floor = (usdc * (10_000 - SLIPPAGE_BPS) as f64 / 10_000.0) as u128;
+        d.amount_in = amt.to_string();
+        d.min_out = floor.max(1).to_string();
+    } else {
+        let usdc: u128 = st.usdc_balance_6dp.parse().unwrap_or(0);
+        let amt = usdc * size / 10_000;
+        if amt == 0 { return; }
+        let wei = (amt as f64 / 1e6) / st.eth_usd * 1e18;
+        let floor = (wei * (10_000 - SLIPPAGE_BPS) as f64 / 10_000.0) as u128;
+        d.amount_in = amt.to_string();
+        d.min_out = floor.max(1).to_string();
+    }
+    d.fee_tier = FEE_TIER;
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -165,19 +212,27 @@ pub struct RunOutput {
     pub commitment: String,
     /// Bulletproofs for this run's risk metrics, or null + reason if the
     /// metrics breach the limits (in which case no proof *can* exist).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk_bundle: Option<RiskProofBundle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk_error: Option<String>,
     /// Decision + salt in the clear — demo/offline mode only (no seal key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sealed: Option<Sealed>,
     /// ChaCha20-Poly1305(nonce ‖ ct ‖ tag) of the Sealed JSON, hex. Only the
     /// enclave and the executor hold the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sealed_enc: Option<String>,
     /// Attested valuation of cross-chain holdings, when inputs were given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement: Option<Settlement>,
     /// Which risk basis the proof covers: "positions" (actual holdings,
     /// contract-checked inputs) or "decision" (legacy/offline).
     #[serde(default)]
     pub risk_basis: String,
+    /// sha256 of the risk bundle JSON (always set when a bundle exists).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_sha256: Option<String>,
 }
 
 fn sma(prices: &[f64], n: usize) -> Option<f64> {
@@ -196,6 +251,9 @@ pub fn decide(params: &Params, input: &RunInput) -> Decision {
         leverage_bps: 0,
         epoch: input.epoch,
         nonce: input.nonce,
+        amount_in: String::new(),
+        min_out: String::new(),
+        fee_tier: 0,
     };
     let (Some(fast), Some(slow)) = (sma(&input.prices, params.fast), sma(&input.prices, params.slow))
     else {
@@ -219,6 +277,9 @@ pub fn decide(params: &Params, input: &RunInput) -> Decision {
         leverage_bps: params.leverage_bps,
         epoch: input.epoch,
         nonce: input.nonce,
+        amount_in: String::new(),
+        min_out: String::new(),
+        fee_tier: 0,
     }
 }
 
@@ -236,7 +297,10 @@ pub fn drawdown_bps(nav_yocto: &str, peak_nav_yocto: &str) -> u64 {
 /// `salt` must come from the TEE's entropy (random_get); injected here so the
 /// logic is testable.
 pub fn run(params: &Params, input: &RunInput, salt: [u8; 32]) -> RunOutput {
-    let decision = decide(params, input);
+    let mut decision = decide(params, input);
+    if let Some(st) = &input.settle {
+        size_trade(&mut decision, st);
+    }
     let decision_json = serde_json::to_string(&decision).expect("decision serializes");
 
     let mut hasher = Sha256::new();
@@ -273,6 +337,12 @@ pub fn run(params: &Params, input: &RunInput, salt: [u8; 32]) -> RunOutput {
 
     let sealed = Sealed { decision_json, salt_hex: hex::encode(salt) };
     let (sealed_plain, sealed_enc) = match params.seal_key_hex.as_deref() {
+        // Attested on-chain delivery: the contract itself checks
+        // sha256(decision||salt) == commitment and acts on the decision in the
+        // same callback, so the reveal travels with the commitment. Params are
+        // still never output; only this one decision becomes public, at the
+        // moment it is executed.
+        _ if input.compact => (Some(sealed), None),
         Some(key_hex) => {
             let key_bytes = hex::decode(key_hex).expect("seal_key_hex");
             let cipher = ChaCha20Poly1305::new_from_slice(&key_bytes).expect("32-byte key");
@@ -300,14 +370,18 @@ pub fn run(params: &Params, input: &RunInput, salt: [u8; 32]) -> RunOutput {
         }
     });
 
+    let bundle_sha256 = risk_bundle.as_ref().map(|b| {
+        hex::encode(Sha256::digest(serde_json::to_string(b).unwrap().as_bytes()))
+    });
     RunOutput {
         commitment,
-        risk_bundle,
+        risk_bundle: if input.compact { None } else { risk_bundle },
         risk_error,
         sealed: sealed_plain,
         sealed_enc,
         settlement,
         risk_basis: risk_basis.into(),
+        bundle_sha256,
     }
 }
 
@@ -332,6 +406,7 @@ mod tests {
             max_drawdown_bps: 2_000,
             settle: None,
             vault_state: None,
+            compact: false,
         }
     }
 
@@ -464,7 +539,7 @@ mod tests {
     #[test]
     fn risk_comes_from_real_positions() {
         // 10 NEAR pool + 0.05 ETH (=25 NEAR) -> 25/35 = 71.4% exposure
-        let hold = Decision { action: "hold".into(), pair: "ETH/USDC".into(), size_bps: 0, leverage_bps: 0, epoch: 1, nonce: 1 };
+        let hold = Decision { action: "hold".into(), pair: "ETH/USDC".into(), size_bps: 0, leverage_bps: 0, epoch: 1, nonce: 1, amount_in: String::new(), min_out: String::new(), fee_tier: 0 };
         let r = real_risk(&vs(10, 35, 1.0), &holdings(0.05, 0.0), &hold);
         assert_eq!(r.exposure_bps, 7143);
         assert_eq!(r.leverage_bps, 7143, "hold: bounded by what is actually held");
@@ -477,7 +552,7 @@ mod tests {
     #[test]
     fn drawdown_uses_onchain_high_water_mark() {
         // NAV 28 over 35 shares = 0.8/share vs HWM 1.0 -> 20% drawdown
-        let hold = Decision { action: "hold".into(), pair: "ETH/USDC".into(), size_bps: 0, leverage_bps: 0, epoch: 1, nonce: 1 };
+        let hold = Decision { action: "hold".into(), pair: "ETH/USDC".into(), size_bps: 0, leverage_bps: 0, epoch: 1, nonce: 1, amount_in: String::new(), min_out: String::new(), fee_tier: 0 };
         let r = real_risk(&vs(3, 35, 1.0), &holdings(0.05, 0.0), &hold);
         assert_eq!(r.drawdown_bps, 2000);
         // 25% -> breach -> no proof can be produced
@@ -501,6 +576,50 @@ mod tests {
             assert!(out.risk_bundle.is_none(), "price {bad} must not produce a proof");
             assert!(out.settlement.is_none());
         }
+    }
+
+    #[test]
+    fn trades_are_sized_inside_the_enclave() {
+        let mut inp = input(rising()); // buy signal
+        inp.vault_state = Some(vs(10, 35, 1.0));
+        inp.settle = Some(holdings(0.05, 100.0)); // 100 USDC
+        let out = run(&params(), &inp, [1u8; 32]);
+        let d: Decision = serde_json::from_str(&out.sealed.unwrap().decision_json).unwrap();
+        assert_eq!(d.action, "buy");
+        assert_eq!(d.amount_in, "40000000", "40% of 100 USDC");
+        // 40 USDC / $2000 * 0.98 = 0.0196 ETH
+        let floor: u128 = d.min_out.parse().unwrap();
+        assert!(floor.abs_diff(19_600_000_000_000_000) < 1_000_000_000, "{floor}");
+        assert_eq!(d.fee_tier, 3000);
+    }
+
+    #[test]
+    fn sell_keeps_a_gas_reserve() {
+        let mut inp = input(falling());
+        inp.vault_state = Some(vs(10, 35, 1.0));
+        inp.settle = Some(holdings(0.012, 0.0)); // 40% would be 0.0048, reserve leaves 0.002
+        let out = run(&Params { size_bps: 10_000, ..params() }, &inp, [1u8; 32]);
+        let d: Decision = serde_json::from_str(&out.sealed.unwrap().decision_json).unwrap();
+        assert_eq!(d.action, "sell");
+        assert_eq!(d.amount_in, "2000000000000000", "never spends the 0.01 ETH gas reserve");
+    }
+
+    #[test]
+    fn compact_output_fits_onchain_limit() {
+        let mut inp = input(rising());
+        inp.vault_state = Some(vs(10, 35, 1.0));
+        inp.settle = Some(holdings(0.05, 100.0));
+        inp.compact = true;
+        let p = Params { seal_key_hex: Some("11".repeat(32)), ..params() };
+        let out = run(&p, &inp, [1u8; 32]);
+        assert!(out.risk_bundle.is_none() && out.bundle_sha256.is_some());
+        let sealed = out.sealed.clone().expect("compact mode reveals with the commitment");
+        let mut h = Sha256::new();
+        h.update(sealed.decision_json.as_bytes());
+        h.update(hex::decode(&sealed.salt_hex).unwrap());
+        assert_eq!(hex::encode(h.finalize()), out.commitment);
+        let n = serde_json::to_string(&out).unwrap().len();
+        assert!(n <= 900, "compact output is {n} bytes: {}", serde_json::to_string(&out).unwrap());
     }
 
     #[test]
