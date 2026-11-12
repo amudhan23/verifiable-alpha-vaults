@@ -87,6 +87,7 @@ fn simulate(v: &SimVault) -> serde_json::Value {
             max_drawdown_bps: limits.max_drawdown_bps,
             settle: None,
             vault_state: None,
+            compact: false,
         };
         let salt = rng.salt();
         let out = run(&v.params, &input, salt);
