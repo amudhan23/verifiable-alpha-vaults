@@ -44,9 +44,18 @@ export class ChainSigExecutor {
       this.contract = new ChainSignatureContract({
         networkId: this.cfg.networkId,
         contractId: MPC_TESTNET_CONTRACT,
-        accountId: this.cfg.accountId,
-        keypair: KeyPair.fromString(this.cfg.privateKey),
+        fallbackRpcUrls: ["https://rpc.testnet.near.org"],
       });
+      this.toRSV = (sig) =>
+        "big_r" in sig
+          ? { r: (sig.big_r.affine_point ?? sig.big_r).substring(2), s: sig.s.scalar ?? sig.s, v: sig.recovery_id + 27 }
+          : sig;
+      // NEAR account that pays for + authorizes the MPC sign call
+      const { connect, keyStores } = await import("near-api-js");
+      const keyStore = new keyStores.InMemoryKeyStore();
+      await keyStore.setKey(this.cfg.networkId, this.cfg.accountId, KeyPair.fromString(this.cfg.privateKey));
+      const near = await connect({ networkId: this.cfg.networkId, nodeUrl: "https://rpc.testnet.near.org", keyStore });
+      this.nearAccount = await near.account(this.cfg.accountId);
       const publicClient = createPublicClient({ chain: sepolia, transport: http(this.cfg.rpcUrl) });
       this.evm = new chainAdapters.evm.EVM({ publicClient, contract: this.contract });
     })();
@@ -79,14 +88,19 @@ export class ChainSigExecutor {
       value: 0n,
       data: this.buildCalldata(commitment, decision),
     });
-    const signature = await this.contract.sign({
-      payload: hashesToSign[0].payload,
-      path: this.cfg.derivationPath,
-      key_version: 0,
+    // request the MPC signature directly from v1.signer-prod.testnet
+    const payloadHex = Array.from(hashesToSign[0], (b) => b.toString(16).padStart(2, "0")).join("");
+    const res = await this.nearAccount.functionCall({
+      contractId: MPC_TESTNET_CONTRACT,
+      methodName: "sign",
+      args: { request: { payload_v2: { Ecdsa: payloadHex }, path: this.cfg.derivationPath, domain_id: 0 } },
+      gas: 300_000_000_000_000n,
+      attachedDeposit: "1",
     });
+    const raw = JSON.parse(Buffer.from(res.status.SuccessValue, "base64").toString());
     const signedTx = this.evm.finalizeTransactionSigning({
       transaction,
-      rsvSignatures: [signature],
+      rsvSignatures: [this.toRSV(raw)],
     });
     const txHash = await this.evm.broadcastTx(signedTx);
     return typeof txHash === "string" ? txHash : txHash.hash ?? JSON.stringify(txHash);
