@@ -40,7 +40,16 @@ fn vault() -> Vault {
             max_position_bps: 5_000,
             allowed_pairs: vec!["ETH/USDC".into()],
         },
+        "alpha-vault-v1".into(),
+        "0x18f92b8ee2dc4bc3bbbdb4138e92f184bc405b7f".into(),
     )
+}
+
+fn state_input(v: &Vault) -> String {
+    serde_json::json!({"vault_state": {
+        "pool_yocto": v.pool.to_string(), "total_shares": v.total_shares.to_string(),
+        "hwm_nps": v.hwm_nav_per_share.to_string(), "external_value_yocto": v.holders_ext_value().to_string(),
+        "max_leverage_bps": 30_000, "max_drawdown_bps": 2_000 }}).to_string()
 }
 
 fn market_input() -> RunInput {
@@ -63,7 +72,7 @@ fn full_pipeline_honest_vault() {
     let mut v = vault();
 
     // investor deposits 1000 yocto
-    ctx("alice.testnet", 1_000);
+    ctx("alice.testnet", 1_000_000_000_000_000_000_000_000);
     v.deposit();
 
     // the "enclave" runs the strategy with sealed params
@@ -80,7 +89,7 @@ fn full_pipeline_honest_vault() {
 
     // executor commits the hash FIRST (this is what makes back-filling impossible)
     ctx("executor.testnet", 0);
-    let id = v.commit_decision(out.commitment.clone(), WASM_HASH.into(), "outlayer-exec-1".into(), None);
+    let id = v.commit_decision(out.commitment.clone(), WASM_HASH.into(), "outlayer-exec-1".into(), state_input(&v));
 
     // ...trade executes on the target chain... then reveal
     v.execute_decision(id, out.sealed.as_ref().unwrap().decision_json.clone(), out.sealed.as_ref().unwrap().salt_hex.clone());
@@ -102,7 +111,7 @@ fn full_pipeline_honest_vault() {
 #[test]
 fn full_pipeline_greedy_params_are_stopped_twice() {
     let mut v = vault();
-    ctx("alice.testnet", 1_000);
+    ctx("alice.testnet", 1_000_000_000_000_000_000_000_000);
     v.deposit();
 
     // malicious sealed params: 10x leverage
@@ -121,7 +130,7 @@ fn full_pipeline_greedy_params_are_stopped_twice() {
 
     // layer 2: the contract refuses the reveal before anything is signed
     ctx("executor.testnet", 0);
-    let id = v.commit_decision(out.commitment.clone(), WASM_HASH.into(), "outlayer-exec-2".into(), None);
+    let id = v.commit_decision(out.commitment.clone(), WASM_HASH.into(), "outlayer-exec-2".into(), state_input(&v));
     v.execute_decision(id, out.sealed.as_ref().unwrap().decision_json.clone(), out.sealed.as_ref().unwrap().salt_hex.clone());
     let c = v.get_commitment(id).unwrap();
     assert_eq!(c.status, CommitmentStatus::Rejected);
@@ -137,7 +146,7 @@ fn full_pipeline_backfilled_winner_is_caught() {
     // honest commit...
     let out = run(&params, &market_input(), [42u8; 32]);
     ctx("executor.testnet", 0);
-    let id = v.commit_decision(out.commitment, WASM_HASH.into(), "outlayer-exec-3".into(), None);
+    let id = v.commit_decision(out.commitment, WASM_HASH.into(), "outlayer-exec-3".into(), state_input(&v));
 
     // ...but the manager tries to reveal a different, winning trade
     let mut fake_input = market_input();
@@ -155,10 +164,10 @@ fn full_pipeline_swapped_code_is_detected() {
     // attestation says different code ran: recorded as Rejected (not a panic,
     // which would revert the alert on-chain) and deposits pause
     let other_hash = "ab".repeat(32);
-    let id = v.commit_decision(out.commitment, other_hash, "outlayer-exec-4".into(), None);
+    let id = v.commit_decision(out.commitment, other_hash, "outlayer-exec-4".into(), state_input(&v));
     assert_eq!(v.get_commitment(id).unwrap().status, CommitmentStatus::Rejected);
     assert!(v.deposits_paused);
-    ctx("alice.testnet", 1_000);
+    ctx("alice.testnet", 1_000_000_000_000_000_000_000_000);
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| v.deposit()));
     assert!(res.is_err(), "deposits must be paused");
 }

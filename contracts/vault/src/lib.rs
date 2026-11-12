@@ -1,20 +1,30 @@
-//! # Verifiable Alpha Vault
+//! # Verifiable Alpha Vault (v4)
 //!
 //! A trading vault whose strategy **parameters stay sealed in a TEE** while
-//! everything an investor needs to check is enforced or logged on-chain:
+//! everything an investor needs to check is enforced or logged on-chain.
 //!
-//! 1. **Which code ran** — every decision arrives with the sha256 of the
-//!    strategy WASM from the OutLayer TDX attestation; a hash that doesn't
-//!    match the approved one is rejected and deposits pause (integrity alert).
-//! 2. **No back-filling** — a trade must be committed (hash only) *before* it
-//!    can be executed/revealed. Revealing data that doesn't match a prior
-//!    commitment aborts.
-//! 3. **Risk limits held** — guardrails (max leverage, position size, asset
-//!    allowlist) are enforced here, *before* any signature is produced; the
-//!    strategy cannot override them. Epoch-level Bulletproof bundles are
-//!    anchored for browser verification.
-//! 4. **Real returns** — share accounting lives on-chain; NAV history is
-//!    public.
+//! v4 is the post-audit redesign. An independent adversarial review of v3
+//! found that a semi-trusted executor could misreport cross-chain value and
+//! drain the pool, that the cross-chain wallet was controlled by the
+//! executor's key rather than the vault, and that emergency claims could pay
+//! out more than was recovered. v4 closes all three:
+//!
+//! * **Withdrawals never depend on reported cross-chain value.** Burning
+//!   shares pays your exact pro-rata slice of the NEAR pool *plus* the same
+//!   slice of the vault's "external units": a pro-rata claim on the
+//!   cross-chain wallet. A misreported valuation cannot pull NEAR out.
+//! * **The vault owns its cross-chain wallet.** The contract itself builds the
+//!   exact EVM transaction (recipient locked to the vault's own address, only
+//!   WETH/Uniswap targets, capped gas) and requests the MPC signature. The
+//!   executor only broadcasts what the vault signed.
+//! * **Cross-chain value is paid out with an accumulator.** Repatriated NEAR
+//!   is distributed per external unit, so total payouts can never exceed what
+//!   was actually returned.
+//! * **Settlements are bounded.** Each moves NAV by at most 10% and they are at
+//!   least 1h apart; performance fees only crystallize on a valuation that has
+//!   stood for 24h. What remains (a semi-trusted valuation inside those bounds)
+//!   is publicly fraud-provable, and removed entirely by the on-chain attested
+//!   path (`request_decision`).
 //!
 //! What stays private: strategy parameters and *future* decisions. Past
 //! trades, once executed, are public by design.
@@ -32,9 +42,64 @@ use near_sdk::{
 };
 
 const EVENT_STANDARD: &str = "alpha-vault";
-const EVENT_VERSION: &str = "1.0.0";
+const EVENT_VERSION: &str = "4.0.0";
 /// Scale for NAV-per-share fixed-point math.
 const NPS_SCALE: u128 = 1_000_000_000_000;
+/// Scale for the per-external-unit payout accumulator.
+const ACC_SCALE: u128 = 1_000_000_000_000_000_000_000_000;
+const ONE_NEAR: u128 = 1_000_000_000_000_000_000_000_000;
+
+/// Smallest accepted deposit. Pays for the depositor's storage many times
+/// over, so spam deposits can't drain the contract's storage balance.
+pub const MIN_DEPOSIT: u128 = ONE_NEAR / 10;
+/// 24h without an attested decision -> anyone may trigger emergency exit.
+pub const DEFAULT_LIVENESS_MS: u64 = 24 * 3_600_000;
+/// Timelock for anything that changes what code runs or which keys sign.
+pub const ROTATION_DELAY_MS: u64 = 48 * 3_600_000;
+/// Settlement bounds: max NAV move per settlement, min spacing.
+pub const MAX_SETTLE_STEP_BPS: u128 = 1_000;
+pub const MIN_SETTLE_INTERVAL_MS: u64 = 3_600_000;
+/// Fees crystallize only on a valuation that has stood this long.
+pub const FEE_SETTLEMENT_AGE_MS: u64 = 24 * 3_600_000;
+const NAV_LOG_CAP: u32 = 2_000;
+/// Fixed unit count created with the first external value (1e24): with
+/// ACC_SCALE 1e24, repatriations up to ~1e14 NEAR stay inside u128.
+pub const EXT_UNITS_BASE: u128 = ONE_NEAR;
+
+// String caps (storage-griefing limits).
+const MAX_INPUT_JSON: usize = 6_000;
+const MAX_BUNDLE_JSON: usize = 8_000;
+const MAX_REF: usize = 300;
+const MAX_DECISION_JSON: usize = 600;
+
+// EVM execution target: Ethereum Sepolia, Uniswap v3 (addresses verified
+// on-chain). The vault will only ever sign transactions to these.
+pub const EVM_CHAIN_ID: u64 = 11_155_111;
+pub const MPC_SIGNER: &str = "v1.signer-prod.testnet";
+const WETH: [u8; 20] = hex20("fff9976782d46cc05630d1f6ebab18b2324d6b14");
+const USDC: [u8; 20] = hex20("1c7d4b196cb0c7b01d743fbc6116a902379c7238");
+const ROUTER: [u8; 20] = hex20("3bfa4769fb09eefc5a80d6e87c3b9c650f7ae48e");
+const MAX_FEE_PER_GAS: u128 = 300_000_000_000; // 300 gwei
+const MAX_GAS_LIMIT: u64 = 400_000;
+
+const fn hex20(s: &str) -> [u8; 20] {
+    let b = s.as_bytes();
+    let mut out = [0u8; 20];
+    let mut i = 0;
+    while i < 20 {
+        out[i] = (nib(b[2 * i]) << 4) | nib(b[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
+const fn nib(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        b'A'..=b'F' => c - b'A' + 10,
+        _ => panic!("bad hex"),
+    }
+}
 
 uint::construct_uint! {
     /// 256-bit unsigned, for share math: yoctoNEAR (1e24) × share counts
@@ -51,6 +116,87 @@ pub fn mul_div(a: u128, b: u128, c: u128) -> u128 {
     r.as_u128()
 }
 
+// ---------------------------------------------------------------------------
+// Minimal RLP + EIP-1559 transaction encoding (so the vault, not a relayer,
+// decides exactly what gets signed).
+// ---------------------------------------------------------------------------
+pub mod evm {
+    fn be_trim(mut v: Vec<u8>) -> Vec<u8> {
+        while v.first() == Some(&0) {
+            v.remove(0);
+        }
+        v
+    }
+    pub fn uint(x: u128) -> Vec<u8> {
+        be_trim(x.to_be_bytes().to_vec())
+    }
+    fn len_prefix(len: usize, short: u8) -> Vec<u8> {
+        if len < 56 {
+            vec![short + len as u8]
+        } else {
+            let l = be_trim((len as u64).to_be_bytes().to_vec());
+            let mut out = vec![short + 55 + l.len() as u8];
+            out.extend(l);
+            out
+        }
+    }
+    pub fn rlp_bytes(b: &[u8]) -> Vec<u8> {
+        if b.len() == 1 && b[0] < 0x80 {
+            return b.to_vec();
+        }
+        let mut out = len_prefix(b.len(), 0x80);
+        out.extend_from_slice(b);
+        out
+    }
+    pub fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
+        let body: Vec<u8> = items.concat();
+        let mut out = len_prefix(body.len(), 0xc0);
+        out.extend(body);
+        out
+    }
+    pub struct Tx1559 {
+        pub chain_id: u64,
+        pub nonce: u64,
+        pub max_priority_fee_per_gas: u128,
+        pub max_fee_per_gas: u128,
+        pub gas_limit: u64,
+        pub to: [u8; 20],
+        pub value: u128,
+        pub data: Vec<u8>,
+    }
+    impl Tx1559 {
+        /// 0x02 || rlp([chainId, nonce, maxPrio, maxFee, gas, to, value, data, []])
+        pub fn signing_bytes(&self) -> Vec<u8> {
+            let mut out = vec![0x02];
+            out.extend(rlp_list(&[
+                rlp_bytes(&uint(self.chain_id as u128)),
+                rlp_bytes(&uint(self.nonce as u128)),
+                rlp_bytes(&uint(self.max_priority_fee_per_gas)),
+                rlp_bytes(&uint(self.max_fee_per_gas)),
+                rlp_bytes(&uint(self.gas_limit as u128)),
+                rlp_bytes(&self.to),
+                rlp_bytes(&uint(self.value)),
+                rlp_bytes(&self.data),
+                rlp_list(&[]),
+            ]));
+            out
+        }
+    }
+    pub fn word_addr(a: &[u8; 20]) -> Vec<u8> {
+        let mut w = vec![0u8; 12];
+        w.extend_from_slice(a);
+        w
+    }
+    pub fn word_u128(x: u128) -> Vec<u8> {
+        let mut w = vec![0u8; 16];
+        w.extend_from_slice(&x.to_be_bytes());
+        w
+    }
+    pub fn word_max() -> Vec<u8> {
+        vec![0xff; 32]
+    }
+}
+
 #[derive(BorshStorageKey)]
 #[near(serializers = [borsh])]
 enum StorageKey {
@@ -63,39 +209,32 @@ enum StorageKey {
     NftEnumeration,
     NftMetadata,
     NftContractMetadata,
-    Claims,
-    ClaimPaid,
+    Claims,    // v3 (retired; kept so later key indices don't shift)
+    ClaimPaid, // v3 (retired)
+    ExtUnits,
+    ExtDebt,
+    ExtPending,
+    SignedLegs,
+    FailedPayouts,
 }
 
-/// The vault's strategy is itself an NFT: whoever holds it earns the
-/// performance fees and may rotate the approved strategy code. Sell the NFT
-/// and the verified track record goes with it.
 pub const STRATEGY_TOKEN_ID: &str = "strategy-1";
 
-/// Risk policy enforced by the contract. The sealed strategy cannot loosen it.
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug)]
 pub struct Guardrails {
-    /// 10_000 = 1x. Vault default: 30_000 (3x).
     pub max_leverage_bps: u64,
-    /// 10_000 = 100%. Vault default: 2_000 (20%). Enforced via posted
-    /// Bulletproof bundles + public NAV; also sanity-checked on reveal.
     pub max_drawdown_bps: u64,
-    /// Max single-trade size as bps of NAV. e.g. 5_000 = 50%.
     pub max_position_bps: u64,
-    /// Trading pairs the strategy may touch, e.g. "ETH/USDC".
     pub allowed_pairs: Vec<String>,
 }
 
-/// The plaintext decision revealed at execution time. The strategy emits this
-/// JSON inside the TEE, commits to sha256(decision_json || salt) first, and
-/// the executor reveals it here when (and only when) the trade is executed.
 #[near(serializers = [json])]
 #[derive(Clone, Debug)]
 pub struct Decision {
-    pub action: String, // "buy" | "sell" | "hold"
-    pub pair: String,   // "ETH/USDC"
-    pub size_bps: u64,  // of NAV
+    pub action: String,
+    pub pair: String,
+    pub size_bps: u64,
     pub leverage_bps: u64,
     pub epoch: u64,
     pub nonce: u64,
@@ -104,11 +243,8 @@ pub struct Decision {
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommitmentStatus {
-    /// Hash committed; decision still sealed.
     Committed,
-    /// Revealed, guardrails passed, execution signed/triggered.
     Executed,
-    /// Revealed but refused by guardrails (reason recorded).
     Rejected,
 }
 
@@ -116,38 +252,20 @@ pub enum CommitmentStatus {
 #[derive(Clone, Debug)]
 pub struct TradeCommitment {
     pub id: u64,
-    /// hex sha256(decision_json_bytes || salt_bytes) — computed inside the TEE.
     pub commitment: String,
-    /// sha256 of the strategy WASM from the TDX attestation for this run.
     pub wasm_hash: String,
-    /// OutLayer execution reference (execution id / NEAR tx) so anyone can
-    /// fetch and verify the TDX quote off-chain.
     pub attestation_ref: String,
     pub committed_at_height: u64,
     pub committed_at_ms: u64,
     pub status: CommitmentStatus,
-    /// Revealed decision JSON (only after execution/rejection).
     pub revealed: Option<String>,
-    /// Salt (hex) published at reveal so anyone can recompute
-    /// sha256(revealed || salt) == commitment.
     pub salt_hex: Option<String>,
-    /// Why a reveal was rejected, if it was.
     pub reject_reason: Option<String>,
-    /// Target-chain tx hash once executed (filled by executor).
     pub execution_ref: Option<String>,
-    /// ChaCha20-Poly1305 ciphertext of {decision, salt}, produced inside the
-    /// enclave (on-chain request path). Only the enclave and the executor
-    /// hold the key; the public sees ciphertext until the reveal.
     pub sealed_enc: Option<String>,
-    /// The exact JSON the enclave received (prices, balances, guardrails).
-    /// sha256 of it equals the TDX attestation's `input_hash`, so anyone can
-    /// check the strategy saw real oracle prices — not ones the manager made up.
     pub input_json: Option<String>,
 }
 
-/// Epoch risk-proof bundle (Bulletproofs), stored opaque; verified in the
-/// browser via the `vault-proofs` WASM. The contract pins the guardrail limits
-/// into the record so a bundle proven against looser limits is detectable.
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug)]
 pub struct StoredRiskProof {
@@ -158,7 +276,6 @@ pub struct StoredRiskProof {
     pub posted_at_ms: u64,
 }
 
-/// One point of public NAV history (pool size after a change).
 #[near(serializers = [borsh])]
 pub struct NavPoint {
     pub ts_ms: u64,
@@ -169,62 +286,52 @@ pub struct NavPoint {
 #[derive(PanicOnDefault)]
 pub struct Vault {
     pub owner: AccountId,
-    /// Account allowed to relay attested decisions (executor daemon or the
-    /// OutLayer yield/resume bridge).
     pub executor: AccountId,
-    /// sha256 (hex) of the approved strategy WASM. Decisions attested to any
-    /// other hash are refused and deposits pause.
     pub approved_wasm_hash: String,
     pub guardrails: Guardrails,
     pub total_shares: u128,
     shares: LookupMap<AccountId, u128>,
-    /// Local pool in yoctoNEAR (deposits/withdrawals). Public at all times.
+    /// NEAR held by the contract for shareholders.
     pub pool: u128,
-    /// Value held on other chains via Chain Signatures, in yoctoNEAR
-    /// equivalent, as last settled through the enclave (attested + fraud-
-    /// provable against the source chain at `last_settlement_ref`).
-    pub external_value: u128,
+    /// Settled value of the WHOLE cross-chain wallet (yoctoNEAR equivalent).
+    pub ext_value: u128,
     pub last_settlement_ref: Option<String>,
-    /// Where the approved strategy wasm lives (FastFS). Pinned together with
-    /// `approved_wasm_hash` into every on-chain execution request, so the
-    /// code-hash guarantee is enforced by OutLayer's contract, not a relayer.
+    pub last_settlement_ms: u64,
     pub strategy_wasm_url: String,
     commitments: Vector<TradeCommitment>,
     risk_proofs: Vector<StoredRiskProof>,
     nav_log: Vector<NavPoint>,
-    /// Performance fee on gains above the high-water mark, in bps (2000 = 20%).
+    nav_log_head: u32,
     pub perf_fee_bps: u64,
-    /// High-water mark: NAV per share, scaled by NPS_SCALE.
     pub hwm_nav_per_share: u128,
-    /// Set when an attestation with a wrong code hash shows up ("cheat 3").
     pub integrity_alert: Option<String>,
     pub deposits_paused: bool,
-    /// NEP-171: the strategy NFT (fee rights + code-rotation rights).
     nft: NonFungibleToken,
     nft_metadata: LazyOption<NFTContractMetadata>,
-    // ---- exit guarantees (v3) ----
-    /// Timestamp of the last attested decision. If it goes stale beyond
-    /// `liveness_timeout_ms`, ANYONE may trigger emergency mode.
     pub last_attested_ms: u64,
     pub liveness_timeout_ms: u64,
-    /// One-way. Freezes deposits/trading; withdrawals pay the local pool
-    /// pro rata immediately and record a pro-rata claim on cross-chain value.
     pub emergency: bool,
-    external_claims: LookupMap<AccountId, u128>,
-    claim_paid: LookupMap<AccountId, u128>,
-    pub total_claims: u128,
-    /// Cross-chain value repatriated after an emergency, distributed to claims.
-    pub recovered_total: u128,
-    /// Chain Signatures derivation path controlling the vault's EVM address.
+    // ---- external units: pro-rata ownership of the cross-chain wallet ----
+    pub ext_units_total: u128,
+    /// Units still owned collectively by shareholders.
+    pub vault_ext_units: u128,
+    ext_units: LookupMap<AccountId, u128>,
+    ext_debt: LookupMap<AccountId, u128>,
+    ext_pending: LookupMap<AccountId, u128>,
+    /// Repatriated NEAR paid per external unit, scaled by ACC_SCALE.
+    pub ext_acc: u128,
+    pub repatriated_total: u128,
+    pub ext_paid_total: u128,
+    // ---- vault-owned cross-chain wallet ----
     pub mpc_path: String,
-    /// (new path, effective_at_ms) — changes are timelocked and public.
-    pub pending_mpc_path: Option<(String, u64)>,
+    /// The EVM address MPC derives for (this contract, mpc_path). Every swap's
+    /// recipient is locked to it.
+    pub evm_address: String,
+    pub pending_wallet: Option<(String, String, u64)>,
+    pub pending_strategy: Option<(String, String, u64)>,
+    signed_legs: LookupMap<String, bool>,
+    failed_payouts: LookupMap<AccountId, u128>,
 }
-
-/// 24h without an attested decision -> anyone may trigger emergency exit.
-pub const DEFAULT_LIVENESS_MS: u64 = 24 * 3_600_000;
-/// MPC path changes wait 48h so depositors can exit first.
-pub const MPC_ROTATION_DELAY_MS: u64 = 48 * 3_600_000;
 
 fn emit(event: &str, data: serde_json::Value) {
     env::log_str(&format!(
@@ -238,6 +345,15 @@ fn emit(event: &str, data: serde_json::Value) {
     ));
 }
 
+fn parse_evm_address(a: &str) -> [u8; 20] {
+    let h = a.strip_prefix("0x").unwrap_or(a);
+    let v = hex::decode(h).unwrap_or_else(|_| env::panic_str("evm address must be hex"));
+    require!(v.len() == 20, "evm address must be 20 bytes");
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&v);
+    out
+}
+
 #[near]
 impl Vault {
     #[init]
@@ -247,6 +363,8 @@ impl Vault {
         approved_wasm_hash: String,
         strategy_wasm_url: String,
         guardrails: Guardrails,
+        mpc_path: String,
+        evm_address: String,
     ) -> Self {
         require!(
             approved_wasm_hash.len() == 64 && hex::decode(&approved_wasm_hash).is_ok(),
@@ -254,6 +372,8 @@ impl Vault {
         );
         require!(guardrails.max_leverage_bps <= 65_535, "limit must fit 16 bits");
         require!(guardrails.max_drawdown_bps <= 10_000, "drawdown limit > 100%");
+        require!(guardrails.max_position_bps <= 10_000, "position limit > 100%");
+        parse_evm_address(&evm_address);
         let mut nft = NonFungibleToken::new(
             StorageKey::NftOwner,
             owner.clone(),
@@ -261,15 +381,13 @@ impl Vault {
             Some(StorageKey::NftEnumeration),
             Some(StorageKey::NftApproval),
         );
-        // mint without a storage-deposit refund: the deployer's account
-        // balance covers the one-time storage for the single strategy token
         nft.internal_mint_with_refund(
             STRATEGY_TOKEN_ID.to_string(),
             owner.clone(),
             Some(TokenMetadata {
                 title: Some("Alpha Vault Strategy #1".into()),
                 description: Some(format!(
-                    "Sealed-parameter strategy attested as wasm {}. Holder earns performance fees and may rotate the approved code (rotation is logged on-chain).",
+                    "Sealed-parameter strategy attested as wasm {}. Holder earns performance fees and controls the (timelocked) strategy and wallet rotations.",
                     approved_wasm_hash
                 )),
                 media: None, media_hash: None, copies: Some(1), issued_at: None,
@@ -279,19 +397,26 @@ impl Vault {
             None,
         );
         Self {
-            nft,
-            external_value: 0,
+            owner,
+            executor,
+            approved_wasm_hash,
+            guardrails,
+            total_shares: 0,
+            shares: LookupMap::new(StorageKey::Shares),
+            pool: 0,
+            ext_value: 0,
             last_settlement_ref: None,
+            last_settlement_ms: 0,
             strategy_wasm_url,
-            last_attested_ms: env::block_timestamp_ms(),
-            liveness_timeout_ms: DEFAULT_LIVENESS_MS,
-            emergency: false,
-            external_claims: LookupMap::new(StorageKey::Claims),
-            claim_paid: LookupMap::new(StorageKey::ClaimPaid),
-            total_claims: 0,
-            recovered_total: 0,
-            mpc_path: "alpha-vault-v1".into(),
-            pending_mpc_path: None,
+            commitments: Vector::new(StorageKey::Commitments),
+            risk_proofs: Vector::new(StorageKey::RiskProofs),
+            nav_log: Vector::new(StorageKey::NavLog),
+            nav_log_head: 0,
+            perf_fee_bps: 2_000,
+            hwm_nav_per_share: NPS_SCALE,
+            integrity_alert: None,
+            deposits_paused: false,
+            nft,
             nft_metadata: LazyOption::new(
                 StorageKey::NftContractMetadata,
                 Some(&NFTContractMetadata {
@@ -301,41 +426,44 @@ impl Vault {
                     icon: None, base_uri: None, reference: None, reference_hash: None,
                 }),
             ),
-            owner,
-            executor,
-            approved_wasm_hash,
-            guardrails,
-            total_shares: 0,
-            shares: LookupMap::new(StorageKey::Shares),
-            pool: 0,
-            commitments: Vector::new(StorageKey::Commitments),
-            risk_proofs: Vector::new(StorageKey::RiskProofs),
-            nav_log: Vector::new(StorageKey::NavLog),
-            perf_fee_bps: 2_000,
-            hwm_nav_per_share: NPS_SCALE, // 1.0
-            integrity_alert: None,
-            deposits_paused: false,
+            last_attested_ms: env::block_timestamp_ms(),
+            liveness_timeout_ms: DEFAULT_LIVENESS_MS,
+            emergency: false,
+            ext_units_total: 0,
+            vault_ext_units: 0,
+            ext_units: LookupMap::new(StorageKey::ExtUnits),
+            ext_debt: LookupMap::new(StorageKey::ExtDebt),
+            ext_pending: LookupMap::new(StorageKey::ExtPending),
+            ext_acc: 0,
+            repatriated_total: 0,
+            ext_paid_total: 0,
+            mpc_path,
+            evm_address,
+            pending_wallet: None,
+            pending_strategy: None,
+            signed_legs: LookupMap::new(StorageKey::SignedLegs),
+            failed_payouts: LookupMap::new(StorageKey::FailedPayouts),
         }
     }
 
-    // ------------------------------------------------------------------
-    // Investor side: shares
-    // ------------------------------------------------------------------
+    // ==================================================================
+    // Shares
+    // ==================================================================
 
-    /// Deposit NEAR, receive vault shares at the current NAV/share.
+    /// Deposit NEAR, receive shares at the current NAV/share.
     #[payable]
     pub fn deposit(&mut self) -> U128 {
         require!(!self.emergency, "vault is in emergency exit mode");
         require!(!self.deposits_paused, "deposits are paused (integrity alert)");
         let amount = env::attached_deposit().as_yoctonear();
-        require!(amount > 0, "attach a deposit");
+        require!(amount >= MIN_DEPOSIT, "minimum deposit is 0.1 NEAR");
         self.crystallize_fees();
         let nav = self.nav();
-        let minted = if self.total_shares == 0 || nav == 0 {
-            amount
-        } else {
-            // shares = amount * total_shares / nav
-            mul_div(amount, self.total_shares, nav)
+        let minted = match (self.total_shares, nav) {
+            (0, 0) => amount,
+            (0, _) => env::panic_str("vault holds value but no shares: refusing to hand it to the next depositor"),
+            (_, 0) => env::panic_str("vault NAV is zero: refusing to dilute the deposit into worthless shares"),
+            (ts, n) => mul_div(amount, ts, n),
         };
         require!(minted > 0, "deposit too small for current NAV/share");
         let who = env::predecessor_account_id();
@@ -344,95 +472,170 @@ impl Vault {
         self.total_shares += minted;
         self.pool += amount;
         self.record_nav();
-        emit(
-            "deposit",
-            serde_json::json!({"account": who, "amount": amount.to_string(), "shares": minted.to_string()}),
-        );
+        emit("deposit", serde_json::json!({"account": who, "amount": amount.to_string(), "shares": minted.to_string()}));
         U128(minted)
     }
 
-    /// Burn shares, withdraw the pro-rata slice of the pool.
+    /// Burn shares. Pays exactly `burn/total` of the NEAR pool now and moves
+    /// exactly `burn/total` of the shareholders' external units to you. The
+    /// payout never depends on the reported cross-chain valuation, so a
+    /// misreported settlement cannot extract anyone's NEAR.
     pub fn withdraw(&mut self, shares: U128) -> Promise {
         let who = env::predecessor_account_id();
-        if self.emergency {
-            return self.emergency_withdraw(who, shares.0);
+        if !self.emergency {
+            self.crystallize_fees();
         }
-        self.crystallize_fees();
-        let have = self.shares.get(&who).copied().unwrap_or(0); // re-read: fee mint may have run
+        let have = self.shares.get(&who).copied().unwrap_or(0);
         let burn = shares.0;
         require!(burn > 0 && burn <= have, "not enough shares");
-        let amount = mul_div(self.nav(), burn, self.total_shares);
-        require!(amount <= self.pool, "insufficient local liquidity: wait for settlement");
+        let local = mul_div(self.pool, burn, self.total_shares);
+        let units = if self.vault_ext_units > 0 {
+            mul_div(self.vault_ext_units, burn, self.total_shares)
+        } else {
+            0
+        };
         self.shares.insert(who.clone(), have - burn);
         self.total_shares -= burn;
-        self.pool -= amount;
+        self.pool -= local;
+        if units > 0 {
+            self.accrue(&who);
+            self.vault_ext_units -= units;
+            let u = self.ext_units.get(&who).copied().unwrap_or(0);
+            self.ext_units.insert(who.clone(), u + units); // snapshot set by accrue()
+        }
+        if self.total_shares == 0 {
+            // last holder out: rounding dust stays unaccounted (never owed),
+            // and the next generation starts at NAV/share 1.0
+            self.pool = 0;
+            self.hwm_nav_per_share = NPS_SCALE;
+        }
         self.record_nav();
-        emit(
-            "withdraw",
-            serde_json::json!({"account": who, "amount": amount.to_string(), "shares": burn.to_string()}),
-        );
-        Promise::new(who).transfer(NearToken::from_yoctonear(amount))
+        emit("withdraw", serde_json::json!({
+            "account": who, "shares": burn.to_string(),
+            "paid_yocto": local.to_string(), "ext_units": units.to_string(),
+        }));
+        self.pay(who, local)
     }
 
-    // ------------------------------------------------------------------
-    // Strategy side: commit -> execute(reveal), guarded
-    // ------------------------------------------------------------------
+    // ==================================================================
+    // Cross-chain value: units, repatriation, payouts
+    // ==================================================================
 
-    /// Record a sealed decision. Called by the executor with the commitment
-    /// hash and the attestation metadata from the OutLayer run that produced
-    /// it. **Verification 1 & 2 live here**: the code hash must match the
-    /// approved strategy, and the commitment timestamp is fixed by this block.
+    /// Return NEAR obtained from the cross-chain wallet (anyone may call:
+    /// executor, manager, or a rescuer after an emergency). It is distributed
+    /// per external unit: the shareholders' part flows back into the pool,
+    /// unit holders accrue theirs. Payouts can never exceed what came back.
+    #[payable]
+    pub fn repatriate(&mut self) {
+        let r = env::attached_deposit().as_yoctonear();
+        require!(r > 0, "attach the repatriated NEAR");
+        require!(self.ext_units_total > 0, "no external units outstanding");
+        require!(self.ext_units_total >= EXT_UNITS_BASE / 1_000, "external units too few to distribute safely");
+        let to_vault = mul_div(r, self.vault_ext_units, self.ext_units_total);
+        self.pool += to_vault;
+        self.ext_acc += mul_div(r, ACC_SCALE, self.ext_units_total);
+        self.ext_value = self.ext_value.saturating_sub(r);
+        self.repatriated_total += r;
+        self.record_nav();
+        emit("repatriated", serde_json::json!({"amount": r.to_string(), "to_pool": to_vault.to_string()}));
+    }
+
+    /// Pay out the caller's accrued share of repatriated NEAR.
+    pub fn claim_external(&mut self) -> Promise {
+        let who = env::predecessor_account_id();
+        self.accrue(&who);
+        let due = self.ext_pending.get(&who).copied().unwrap_or(0);
+        require!(due > 0, "nothing to claim yet");
+        self.ext_pending.insert(who.clone(), 0);
+        self.ext_paid_total += due;
+        emit("external_claimed", serde_json::json!({"account": who, "amount": due.to_string()}));
+        self.pay(who, due)
+    }
+
+    /// Credit `units × (acc − acc_at_last_accrual)`, floored. Flooring the
+    /// DIFFERENCE (not each total) means no account is ever credited more
+    /// than its exact share, so the contract stays solvent to the yocto.
+    /// (`ext_debt` stores each account's accumulator snapshot.)
+    fn accrue(&mut self, who: &AccountId) {
+        let u = self.ext_units.get(who).copied().unwrap_or(0);
+        let snap = self.ext_debt.get(who).copied().unwrap_or(self.ext_acc);
+        if u > 0 && self.ext_acc > snap {
+            let p = self.ext_pending.get(who).copied().unwrap_or(0);
+            self.ext_pending.insert(who.clone(), p + mul_div(u, self.ext_acc - snap, ACC_SCALE));
+        }
+        self.ext_debt.insert(who.clone(), self.ext_acc);
+    }
+
+    pub fn get_external_position(&self, account: AccountId) -> serde_json::Value {
+        let u = self.ext_units.get(&account).copied().unwrap_or(0);
+        let snap = self.ext_debt.get(&account).copied().unwrap_or(self.ext_acc);
+        let pending = self.ext_pending.get(&account).copied().unwrap_or(0)
+            + if u > 0 { mul_div(u, self.ext_acc.saturating_sub(snap), ACC_SCALE) } else { 0 };
+        let value = if self.ext_units_total > 0 { mul_div(self.ext_value, u, self.ext_units_total) } else { 0 };
+        serde_json::json!({
+            "units": u.to_string(),
+            "est_value_yocto": value.to_string(),
+            "claimable_yocto": pending.to_string(),
+            "failed_payout_yocto": self.failed_payouts.get(&account).copied().unwrap_or(0).to_string(),
+        })
+    }
+
+    /// Transfers that fail (e.g. a deleted account) are credited back here
+    /// instead of vanishing from the books.
+    fn pay(&mut self, to: AccountId, amount: u128) -> Promise {
+        Promise::new(to.clone())
+            .transfer(NearToken::from_yoctonear(amount))
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(Gas::from_tgas(5))
+                    .on_payout(to, U128(amount)),
+            )
+    }
+
+    #[private]
+    pub fn on_payout(&mut self, to: AccountId, amount: U128) {
+        if !matches!(env::promise_result(0), PromiseResult::Successful(_)) {
+            let f = self.failed_payouts.get(&to).copied().unwrap_or(0);
+            self.failed_payouts.insert(to.clone(), f + amount.0);
+            emit("payout_failed", serde_json::json!({"account": to, "amount": amount.0.to_string()}));
+        }
+    }
+
+    pub fn retry_payout(&mut self) -> Promise {
+        let who = env::predecessor_account_id();
+        let f = self.failed_payouts.get(&who).copied().unwrap_or(0);
+        require!(f > 0, "no failed payout");
+        self.failed_payouts.insert(who.clone(), 0);
+        self.pay(who, f)
+    }
+
+    // ==================================================================
+    // Strategy: commit -> reveal (guarded) -> vault-signed execution
+    // ==================================================================
+
     pub fn commit_decision(
         &mut self,
         commitment: String,
         wasm_hash: String,
         attestation_ref: String,
-        input_json: Option<String>,
+        input_json: String,
     ) -> u64 {
         self.assert_executor();
         require!(!self.emergency, "vault is in emergency exit mode");
-        require!(
-            commitment.len() == 64 && hex::decode(&commitment).is_ok(),
-            "commitment must be 32 bytes hex"
-        );
-        if let Some(ij) = &input_json {
-            if let Err(e) = self.check_input_state(ij) {
-                env::panic_str(&e);
-            }
+        require!(commitment.len() == 64 && hex::decode(&commitment).is_ok(), "commitment must be 32 bytes hex");
+        require!(attestation_ref.len() <= MAX_REF, "attestation_ref too long");
+        require!(input_json.len() <= MAX_INPUT_JSON, "input_json too long");
+        if let Err(e) = self.check_input_state(&input_json) {
+            env::panic_str(&e);
         }
         let id = self.commitments.len() as u64;
-
-        if wasm_hash != self.approved_wasm_hash {
-            // Cheat 3: someone swapped the strategy code. Record the refusal
-            // (a panic would ROLL BACK the alert on-chain), pause deposits,
-            // raise the alert — the leaderboard badge goes red.
-            self.integrity_alert = Some(format!(
-                "attested wasm {} != approved {}",
-                wasm_hash, self.approved_wasm_hash
-            ));
+        let honest = wasm_hash == self.approved_wasm_hash;
+        if !honest {
+            // recorded, not reverted (a panic would roll back the alert)
+            self.integrity_alert = Some(format!("attested wasm {} != approved {}", wasm_hash, self.approved_wasm_hash));
             self.deposits_paused = true;
-            emit(
-                "integrity_alert",
-                serde_json::json!({"id": id, "attested": wasm_hash, "approved": self.approved_wasm_hash}),
-            );
-            self.commitments.push(TradeCommitment {
-                id,
-                commitment,
-                wasm_hash,
-                attestation_ref,
-                committed_at_height: env::block_height(),
-                committed_at_ms: env::block_timestamp_ms(),
-                status: CommitmentStatus::Rejected,
-                revealed: None,
-                salt_hex: None,
-                reject_reason: Some("attested code hash does not match approved strategy; deposits paused".into()),
-                execution_ref: None,
-                sealed_enc: None,
-                input_json,
-            });
-            return id;
+            emit("integrity_alert", serde_json::json!({"id": id, "attested": wasm_hash, "approved": self.approved_wasm_hash}));
         }
-
         self.commitments.push(TradeCommitment {
             id,
             commitment: commitment.clone(),
@@ -440,183 +643,238 @@ impl Vault {
             attestation_ref,
             committed_at_height: env::block_height(),
             committed_at_ms: env::block_timestamp_ms(),
-            status: CommitmentStatus::Committed,
+            status: if honest { CommitmentStatus::Committed } else { CommitmentStatus::Rejected },
             revealed: None,
             salt_hex: None,
-            reject_reason: None,
+            reject_reason: if honest { None } else { Some("attested code hash does not match approved strategy; deposits paused".into()) },
             execution_ref: None,
             sealed_enc: None,
-            input_json,
+            input_json: Some(input_json),
         });
-        self.last_attested_ms = env::block_timestamp_ms();
-        emit("commit", serde_json::json!({"id": id, "commitment": commitment}));
+        if honest {
+            self.last_attested_ms = env::block_timestamp_ms();
+            emit("commit", serde_json::json!({"id": id, "commitment": commitment}));
+        }
         id
     }
 
-    /// Reveal a committed decision and (if the guardrails pass) mark it for
-    /// execution. **Verification 2 & 3 live here**:
-    /// * the revealed bytes must hash to the prior commitment — a trade that
-    ///   was never committed cannot be smuggled in after the fact;
-    /// * the guardrails are checked *before* anything would be signed — the
-    ///   sealed strategy cannot exceed them no matter what its parameters say.
     pub fn execute_decision(&mut self, id: u64, decision_json: String, salt_hex: String) {
         self.assert_executor();
+        require!(decision_json.len() <= MAX_DECISION_JSON, "decision too long");
+        require!(salt_hex.len() <= 128, "salt too long");
         let c = self
             .commitments
             .get(id as u32)
             .unwrap_or_else(|| env::panic_str("no such commitment: trade was never committed"))
             .clone();
-        require!(
-            c.status == CommitmentStatus::Committed,
-            "commitment already settled"
-        );
-
-        // --- no back-filling: reveal must match the prior commitment -----
+        require!(c.status == CommitmentStatus::Committed, "commitment already settled");
         let salt = hex::decode(&salt_hex).unwrap_or_else(|_| env::panic_str("salt must be hex"));
         let mut preimage = decision_json.as_bytes().to_vec();
         preimage.extend_from_slice(&salt);
-        let digest = hex::encode(env::sha256(&preimage));
-        if digest != c.commitment {
-            env::panic_str(
-                "reveal does not match commitment: this trade was not committed when claimed",
-            );
+        if hex::encode(env::sha256(&preimage)) != c.commitment {
+            env::panic_str("reveal does not match commitment: this trade was not committed when claimed");
         }
-
-        // --- guardrails: checked before any signature exists --------------
-        let d: Decision = serde_json::from_str(&decision_json)
-            .unwrap_or_else(|_| env::panic_str("decision is not valid JSON"));
-        if let Err(reason) = self.check_guardrails(&d) {
-            let entry = self.commitments.get_mut(id as u32).unwrap();
-            entry.status = CommitmentStatus::Rejected;
-            entry.revealed = Some(decision_json.clone());
-            entry.salt_hex = Some(salt_hex.clone());
-            entry.reject_reason = Some(reason.clone());
-            emit(
-                "guardrail_rejected",
-                serde_json::json!({"id": id, "reason": reason, "decision": decision_json}),
-            );
-            return; // refused; nothing will be signed
-        }
-
+        let d: Decision = serde_json::from_str(&decision_json).unwrap_or_else(|_| env::panic_str("decision is not valid JSON"));
         let entry = self.commitments.get_mut(id as u32).unwrap();
-        entry.status = CommitmentStatus::Executed;
         entry.revealed = Some(decision_json.clone());
-        entry.salt_hex = Some(salt_hex.clone());
-        emit(
-            "executed",
-            serde_json::json!({"id": id, "decision": decision_json}),
-        );
-        // Chain Signatures: the call to v1.signer-prod.testnet to sign the
-        // target-chain tx is attached here by the executor flow (see
-        // `docs/execution.md`); it only ever runs after the checks above.
+        entry.salt_hex = Some(salt_hex);
+        match self.check_guardrails(&d) {
+            Err(reason) => {
+                let entry = self.commitments.get_mut(id as u32).unwrap();
+                entry.status = CommitmentStatus::Rejected;
+                entry.reject_reason = Some(reason.clone());
+                emit("guardrail_rejected", serde_json::json!({"id": id, "reason": reason, "decision": decision_json}));
+            }
+            Ok(()) => {
+                self.commitments.get_mut(id as u32).unwrap().status = CommitmentStatus::Executed;
+                emit("executed", serde_json::json!({"id": id, "decision": decision_json}));
+            }
+        }
     }
 
-    /// Executor records the target-chain tx hash after broadcast.
+    /// The vault builds the EVM transaction for one leg of an executed
+    /// decision and asks the MPC network to sign it. Recipient is locked to
+    /// the vault's own address; targets are only WETH / USDC (approve) / the
+    /// Uniswap router; gas is capped; each leg can be signed once per
+    /// decision. The executor merely broadcasts the result.
+    #[payable]
+    pub fn sign_evm_tx(
+        &mut self,
+        id: u64,
+        leg: String,
+        nonce: u64,
+        max_fee_per_gas: U128,
+        max_priority_fee_per_gas: U128,
+        gas_limit: u64,
+        amount_in: U128,
+        amount_out_min: U128,
+        fee_tier: u32,
+    ) -> Promise {
+        self.assert_executor();
+        require!(!self.emergency, "vault is in emergency exit mode");
+        let c = self.commitments.get(id as u32).unwrap_or_else(|| env::panic_str("no such commitment")).clone();
+        require!(c.status == CommitmentStatus::Executed, "decision not executed (or rejected by guardrails)");
+        let d: Decision = serde_json::from_str(c.revealed.as_deref().unwrap_or("")).unwrap_or_else(|_| env::panic_str("no revealed decision"));
+        require!(d.pair == "ETH/USDC", "only ETH/USDC is wired for execution");
+        require!(d.action == "buy" || d.action == "sell", "nothing to execute for this decision");
+        require!(max_fee_per_gas.0 <= MAX_FEE_PER_GAS, "max_fee_per_gas above cap");
+        require!(max_priority_fee_per_gas.0 <= max_fee_per_gas.0, "priority fee above max fee");
+        require!(gas_limit <= MAX_GAS_LIMIT, "gas_limit above cap");
+        let key = format!("{id}:{leg}");
+        require!(self.signed_legs.get(&key).is_none(), "this leg was already signed for this decision");
+        let me = parse_evm_address(&self.evm_address);
+        let (token_in, token_out) = if d.action == "sell" { (WETH, USDC) } else { (USDC, WETH) };
+        let (to, value, data) = match leg.as_str() {
+            "wrap" => {
+                require!(d.action == "sell", "wrap is only needed to sell ETH");
+                (WETH, amount_in.0, hex::decode("d0e30db0").unwrap())
+            }
+            "approve" => {
+                let mut data = hex::decode("095ea7b3").unwrap();
+                data.extend(evm::word_addr(&ROUTER));
+                data.extend(evm::word_max());
+                (token_in, 0, data)
+            }
+            "swap" => {
+                require!(matches!(fee_tier, 500 | 3000 | 10000), "unknown fee tier");
+                require!(amount_out_min.0 > 0, "amount_out_min must be set (slippage guard)");
+                let mut data = hex::decode("04e45aaf").unwrap();
+                data.extend(evm::word_addr(&token_in));
+                data.extend(evm::word_addr(&token_out));
+                data.extend(evm::word_u128(fee_tier as u128));
+                data.extend(evm::word_addr(&me)); // recipient: the vault itself
+                data.extend(evm::word_u128(amount_in.0));
+                data.extend(evm::word_u128(amount_out_min.0));
+                data.extend(evm::word_u128(0)); // sqrtPriceLimitX96
+                data.extend(hex::decode(&c.commitment).unwrap()); // tie trade to commitment
+                (ROUTER, 0, data)
+            }
+            _ => env::panic_str("leg must be wrap | approve | swap"),
+        };
+        let tx = evm::Tx1559 {
+            chain_id: EVM_CHAIN_ID,
+            nonce,
+            max_priority_fee_per_gas: max_priority_fee_per_gas.0,
+            max_fee_per_gas: max_fee_per_gas.0,
+            gas_limit,
+            to,
+            value,
+            data,
+        };
+        let payload = env::keccak256(&tx.signing_bytes());
+        let payload_hex = hex::encode(&payload);
+        self.signed_legs.insert(key.clone(), true);
+        emit("evm_sign_requested", serde_json::json!({"id": id, "leg": leg, "nonce": nonce, "payload": payload_hex}));
+        let args = serde_json::json!({"request": {
+            "payload_v2": {"Ecdsa": payload_hex}, "path": self.mpc_path, "domain_id": 0,
+        }});
+        Promise::new(MPC_SIGNER.parse().unwrap())
+            .function_call("sign".to_string(), args.to_string().into_bytes(), env::attached_deposit(), Gas::from_tgas(200))
+            .then(Self::ext(env::current_account_id()).with_static_gas(Gas::from_tgas(15)).on_signed(key, payload_hex))
+    }
+
+    #[private]
+    pub fn on_signed(&mut self, key: String, payload_hex: String) -> Option<serde_json::Value> {
+        match env::promise_result(0) {
+            PromiseResult::Successful(b) => {
+                let sig: serde_json::Value = serde_json::from_slice(&b).unwrap_or(serde_json::Value::Null);
+                emit("evm_signed", serde_json::json!({"leg": key, "payload": payload_hex}));
+                Some(sig)
+            }
+            _ => {
+                self.signed_legs.remove(&key); // allow a retry
+                emit("evm_sign_failed", serde_json::json!({"leg": key}));
+                None
+            }
+        }
+    }
+
     pub fn record_execution_ref(&mut self, id: u64, execution_ref: String) {
         self.assert_executor();
-        let entry = self
-            .commitments
-            .get_mut(id as u32)
-            .unwrap_or_else(|| env::panic_str("no such commitment"));
-        require!(
-            entry.status == CommitmentStatus::Executed,
-            "commitment not executed"
-        );
+        require!(execution_ref.len() <= MAX_REF, "execution_ref too long");
+        let entry = self.commitments.get_mut(id as u32).unwrap_or_else(|| env::panic_str("no such commitment"));
+        require!(entry.status == CommitmentStatus::Executed, "commitment not executed");
         entry.execution_ref = Some(execution_ref);
     }
 
-    /// Settle the value held on other chains into the vault's NAV. The
-    /// figures are computed INSIDE the enclave from balances given in its
-    /// input (so they are bound into the TDX attestation's input/output
-    /// hashes) and are fraud-provable: anyone can re-read the source chain at
-    /// `evm_block` and compare. A dishonest executor can only relay what the
-    /// enclave emitted or nothing at all.
-    pub fn settle_pnl(
-        &mut self,
-        external_value: U128,
-        evm_block: u64,
-        attestation_ref: String,
-    ) -> () {
+    /// Settle the cross-chain wallet's value (computed in the enclave from
+    /// attested, published inputs). Bounded: NAV may move at most 10% per
+    /// settlement, settlements are >= 1h apart. Withdrawals never read this
+    /// number, so a misreport cannot extract NEAR; it can only skew deposit
+    /// pricing within the bound, and it is publicly fraud-provable.
+    pub fn settle_pnl(&mut self, ext_value: U128, evm_block: u64, attestation_ref: String) {
         self.assert_executor();
         require!(!self.emergency, "vault is in emergency exit mode");
-        let first = self.last_settlement_ref.is_none() && self.external_value == 0;
-        if first && external_value.0 > 0 {
-            // The cross-chain wallet was funded out-of-band (not via deposit).
-            // That is capital, not performance: mint shares to the manager at
-            // the current NAV/share instead of booking a fake gain (and fee).
-            let nav = self.nav();
-            let minted = if self.total_shares == 0 || nav == 0 {
-                external_value.0
-            } else {
-                mul_div(external_value.0, self.total_shares, nav)
-            };
-            let m = self.manager_account();
-            let cur = self.shares.get(&m).copied().unwrap_or(0);
-            self.shares.insert(m.clone(), cur + minted);
-            self.total_shares += minted;
-            emit(
-                "seed_capital",
-                serde_json::json!({"manager": m, "value_yocto": external_value.0.to_string(), "shares": minted.to_string()}),
-            );
-        } else {
-            self.crystallize_fees();
+        require!(attestation_ref.len() <= MAX_REF, "attestation_ref too long");
+        let now = env::block_timestamp_ms();
+        require!(
+            self.last_settlement_ms == 0 || now >= self.last_settlement_ms + MIN_SETTLE_INTERVAL_MS,
+            "settlements must be at least 1h apart"
+        );
+        let old_nav = self.nav();
+        let old = self.ext_value;
+        // units come into existence only with real value, at a fixed large
+        // base (keeps the per-unit payout accumulator far from overflow)
+        let first = self.ext_units_total == 0 && ext_value.0 > 0;
+        if first {
+            require!(self.total_shares > 0, "no shareholders to own external value");
         }
-        let old = self.external_value;
-        self.external_value = external_value.0;
+        // validate before writing anything
+        let (units_total, vault_units) = if first {
+            (EXT_UNITS_BASE, EXT_UNITS_BASE)
+        } else if self.ext_units_total == 0 {
+            (1, 1) // value stays 0: nothing to attribute yet
+        } else {
+            (self.ext_units_total, self.vault_ext_units)
+        };
+        let new_holders = mul_div(ext_value.0, vault_units, units_total);
+        let new_nav = self.pool + new_holders;
+        let max_step = mul_div(old_nav, MAX_SETTLE_STEP_BPS, 10_000);
+        require!(
+            new_nav.abs_diff(old_nav) <= max_step,
+            "settlement moves NAV by more than 10%: split it across settlements"
+        );
+        if first {
+            // first external value ever: units owned by shareholders. No shares
+            // are minted (the v3 seed-capital mint was an exploit).
+            self.ext_units_total = units_total;
+            self.vault_ext_units = vault_units;
+        }
+        self.ext_value = ext_value.0;
+        self.last_settlement_ms = now;
         self.last_settlement_ref = Some(format!("evm block {} · {}", evm_block, attestation_ref));
         self.record_nav();
-        emit(
-            "settlement",
-            serde_json::json!({
-                "old_external": old.to_string(),
-                "new_external": external_value.0.to_string(),
-                "evm_block": evm_block,
-                "attestation_ref": attestation_ref,
-            }),
-        );
+        emit("settlement", serde_json::json!({
+            "old_ext": old.to_string(), "new_ext": ext_value.0.to_string(),
+            "evm_block": evm_block, "attestation_ref": attestation_ref,
+        }));
     }
 
-    /// Anchor an epoch Bulletproof bundle (leverage/drawdown stayed in range).
-    /// The cryptographic verification happens in the browser via WASM; the
-    /// contract pins the limits so a bundle proven against looser limits is
-    /// detectable on sight.
     pub fn post_risk_proof(&mut self, epoch: u64, bundle_json: String) {
         self.assert_executor();
-        let v: serde_json::Value = serde_json::from_str(&bundle_json)
-            .unwrap_or_else(|_| env::panic_str("bundle is not valid JSON"));
-        let lev_limit = v["leverage"]["limit"].as_u64().unwrap_or(0);
-        let dd_limit = v["drawdown"]["limit"].as_u64().unwrap_or(0);
-        require!(
-            lev_limit == self.guardrails.max_leverage_bps
-                && dd_limit == self.guardrails.max_drawdown_bps,
-            "bundle limits do not match vault guardrails"
-        );
+        require!(bundle_json.len() <= MAX_BUNDLE_JSON, "bundle too large");
+        let v: serde_json::Value = serde_json::from_str(&bundle_json).unwrap_or_else(|_| env::panic_str("bundle is not valid JSON"));
+        let lev = v["leverage"]["limit"].as_u64().unwrap_or(0);
+        let dd = v["drawdown"]["limit"].as_u64().unwrap_or(0);
+        require!(lev == self.guardrails.max_leverage_bps && dd == self.guardrails.max_drawdown_bps, "bundle limits do not match vault guardrails");
         self.risk_proofs.push(StoredRiskProof {
-            epoch,
-            max_leverage_bps: lev_limit,
-            max_drawdown_bps: dd_limit,
-            bundle_json,
-            posted_at_ms: env::block_timestamp_ms(),
+            epoch, max_leverage_bps: lev, max_drawdown_bps: dd, bundle_json, posted_at_ms: env::block_timestamp_ms(),
         });
         emit("risk_proof", serde_json::json!({"epoch": epoch}));
     }
 
-    /// Ask OutLayer, ON-CHAIN, to run the sealed strategy. The request pins
-    /// `approved_wasm_hash` into the WasmUrl source, so OutLayer itself
-    /// refuses to run anything but the approved code — no relayer to trust
-    /// for the code-hash guarantee. The callback stores the commitment (and
-    /// the encrypted decision) in the same block the chain learns it.
+    /// On-chain request to OutLayer (attested by construction: only
+    /// DCAP-verified worker keys may resolve it). Input is checked against the
+    /// vault's state both now and again in the callback.
     #[payable]
     pub fn request_decision(&mut self, input_json: String) -> Promise {
         require!(!self.emergency, "vault is in emergency exit mode");
-        require!(
-            env::predecessor_account_id() == self.executor
-                || env::predecessor_account_id() == self.owner,
-            "executor or owner"
-        );
-        // Project source, pinned to the approved build via version_key: the
-        // workers keep projects compiled + warm (raw WasmUrl requests sat in
-        // the queue past the yield timeout on testnet).
+        let caller = env::predecessor_account_id();
+        require!(caller == self.executor || caller == self.manager_account(), "executor or strategy-NFT holder");
+        require!(input_json.len() <= MAX_INPUT_JSON, "input_json too long");
+        if let Err(e) = self.check_input_state(&input_json) {
+            env::panic_str(&e);
+        }
         let args = serde_json::json!({
             "source": { "Project": {
                 "project_id": format!("{}/alpha-vault-strategy", self.owner),
@@ -627,17 +885,8 @@ impl Vault {
             "secrets_ref": { "profile": "default", "account_id": self.owner },
         });
         Promise::new("outlayer.testnet".parse().unwrap())
-            .function_call(
-                "request_execution".to_string(),
-                args.to_string().into_bytes(),
-                env::attached_deposit(),
-                Gas::from_tgas(150),
-            )
-            .then(
-                Self::ext(env::current_account_id())
-                    .with_static_gas(Gas::from_tgas(40))
-                    .on_decision(input_json),
-            )
+            .function_call("request_execution".to_string(), args.to_string().into_bytes(), env::attached_deposit(), Gas::from_tgas(150))
+            .then(Self::ext(env::current_account_id()).with_static_gas(Gas::from_tgas(40)).on_decision(input_json))
     }
 
     #[private]
@@ -649,24 +898,23 @@ impl Vault {
                 return None;
             }
         };
-        // response_format Text: the result is the WASM's stdout, possibly
-        // JSON-string-encoded by the runtime; handle both.
+        if let Err(e) = self.check_input_state(&input_json) {
+            emit("decision_request_failed", serde_json::json!({"reason": e}));
+            return None;
+        }
         let text = String::from_utf8(bytes).unwrap_or_default();
-        let parsed: Option<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|v| {
-                // OutLayer wraps results; accept raw stdout JSON, a JSON
-                // string of it, or {"output": ...}
-                let v = if v.is_string() { serde_json::from_str(v.as_str().unwrap()).ok()? } else { v };
-                if v.get("commitment").is_some() { return Some(v); }
-                let inner = v.get("output").or_else(|| v.get("result"))?.clone();
-                if inner.is_string() { serde_json::from_str(inner.as_str().unwrap()).ok() } else { Some(inner) }
-            });
+        let parsed: Option<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| {
+            let v = if v.is_string() { serde_json::from_str(v.as_str().unwrap()).ok()? } else { v };
+            if v.get("commitment").is_some() {
+                return Some(v);
+            }
+            let inner = v.get("output").or_else(|| v.get("result"))?.clone();
+            if inner.is_string() { serde_json::from_str(inner.as_str().unwrap()).ok() } else { Some(inner) }
+        });
         let out = match parsed {
             Some(o) if o["commitment"].as_str().map_or(false, |c| c.len() == 64) => o,
             _ => {
-                // record the failure on-chain instead of reverting silently
-                emit("decision_request_failed", serde_json::json!({"raw": text.chars().take(600).collect::<String>()}));
+                emit("decision_request_failed", serde_json::json!({"raw": text.chars().take(300).collect::<String>()}));
                 return None;
             }
         };
@@ -675,9 +923,8 @@ impl Vault {
         self.commitments.push(TradeCommitment {
             id,
             commitment: commitment.clone(),
-            // structurally guaranteed: the request pinned this hash
             wasm_hash: self.approved_wasm_hash.clone(),
-            attestation_ref: "onchain request_execution (hash pinned in WasmUrl source)".into(),
+            attestation_ref: "onchain request_execution (version pinned to approved hash)".into(),
             committed_at_height: env::block_height(),
             committed_at_ms: env::block_timestamp_ms(),
             status: CommitmentStatus::Committed,
@@ -685,314 +932,222 @@ impl Vault {
             salt_hex: None,
             reject_reason: None,
             execution_ref: None,
-            sealed_enc: out["sealed_enc"].as_str().map(|x| x.to_string()),
+            sealed_enc: out["sealed_enc"].as_str().map(|x| x.chars().take(2_000).collect()),
             input_json: Some(input_json),
         });
         self.last_attested_ms = env::block_timestamp_ms();
         emit("commit", serde_json::json!({"id": id, "commitment": commitment, "path": "onchain"}));
-        // the enclave's risk proof rides the same output
-        if out["risk_bundle"].is_object() {
-            let bundle = out["risk_bundle"].clone();
-            let lev = bundle["leverage"]["limit"].as_u64().unwrap_or(0);
-            let dd = bundle["drawdown"]["limit"].as_u64().unwrap_or(0);
-            if lev == self.guardrails.max_leverage_bps && dd == self.guardrails.max_drawdown_bps {
-                self.risk_proofs.push(StoredRiskProof {
-                    epoch: bundle["epoch"].as_u64().unwrap_or(0),
-                    max_leverage_bps: lev,
-                    max_drawdown_bps: dd,
-                    bundle_json: bundle.to_string(),
-                    posted_at_ms: env::block_timestamp_ms(),
-                });
-            }
-        }
         Some(id)
     }
 
-    // ------------------------------------------------------------------
-    // Exit guarantees: what happens if the manager, executor or OutLayer
-    // disappears. No admin key can block any of this.
-    // ------------------------------------------------------------------
+    // ==================================================================
+    // Exit guarantees
+    // ==================================================================
 
     pub fn is_stale(&self) -> bool {
         env::block_timestamp_ms().saturating_sub(self.last_attested_ms) > self.liveness_timeout_ms
     }
 
-    /// Callable by ANYONE once no attested decision has landed for the
-    /// liveness timeout. One-way: the manager cannot cancel it.
+    /// Anyone, once the vault has been silent past the liveness timeout.
+    /// One-way. Freezes deposits, trading and settlement; withdrawals keep
+    /// working (pool slice + external units), repatriation keeps working.
     pub fn trigger_emergency(&mut self) {
         require!(!self.emergency, "already in emergency mode");
         require!(self.is_stale(), "vault is live: last attested decision is within the timeout");
         self.emergency = true;
         self.deposits_paused = true;
-        emit(
-            "emergency_triggered",
-            serde_json::json!({
-                "by": env::predecessor_account_id(),
-            "last_attested_ms": self.last_attested_ms,
-                "pool_yocto": self.pool.to_string(),
-                "external_value_yocto": self.external_value.to_string(),
-            }),
-        );
+        emit("emergency_triggered", serde_json::json!({
+            "by": env::predecessor_account_id(), "last_attested_ms": self.last_attested_ms,
+        }));
     }
 
-    /// Pays the local pool pro rata NOW; records a pro-rata claim on the
-    /// cross-chain value. Remaining holders keep exactly their proportion.
-    fn emergency_withdraw(&mut self, who: AccountId, burn: u128) -> Promise {
-        let have = self.shares.get(&who).copied().unwrap_or(0);
-        require!(burn > 0 && burn <= have, "not enough shares");
-        let local = mul_div(self.pool, burn, self.total_shares);
-        let claim = mul_div(self.external_value, burn, self.total_shares);
-        self.shares.insert(who.clone(), have - burn);
-        self.total_shares -= burn;
-        self.pool -= local;
-        self.external_value -= claim;
-        if claim > 0 {
-            let c = self.external_claims.get(&who).copied().unwrap_or(0);
-            self.external_claims.insert(who.clone(), c + claim);
-            self.total_claims += claim;
-        }
-        self.record_nav();
-        emit(
-            "emergency_withdraw",
-            serde_json::json!({"account": who, "paid_yocto": local.to_string(), "claim_yocto": claim.to_string()}),
-        );
-        Promise::new(who).transfer(NearToken::from_yoctonear(local))
+    // ==================================================================
+    // Timelocked rotations (strategy code, signing wallet)
+    // ==================================================================
+
+    pub fn propose_strategy(&mut self, wasm_hash: String, wasm_url: String) {
+        self.assert_manager();
+        require!(wasm_hash.len() == 64 && hex::decode(&wasm_hash).is_ok(), "wasm_hash must be 32 bytes hex");
+        require!(wasm_url.len() <= MAX_REF, "url too long");
+        let at = env::block_timestamp_ms() + ROTATION_DELAY_MS;
+        emit("strategy_proposed", serde_json::json!({"hash": wasm_hash, "url": wasm_url, "effective_at_ms": at}));
+        self.pending_strategy = Some((wasm_hash, wasm_url, at));
     }
 
-    /// Anyone (executor, manager, a rescuer) can return cross-chain value
-    /// after an emergency; it is shared pro rata across recorded claims.
-    #[payable]
-    pub fn deposit_recovered(&mut self) {
-        require!(self.emergency, "only after an emergency");
-        let amt = env::attached_deposit().as_yoctonear();
-        require!(amt > 0, "attach the recovered amount");
-        self.recovered_total += amt;
-        emit("recovered", serde_json::json!({"amount": amt.to_string(), "total": self.recovered_total.to_string()}));
-    }
-
-    /// Pay out the caller's pro-rata share of everything recovered so far,
-    /// capped at their claim.
-    pub fn claim_recovered(&mut self) -> Promise {
-        let who = env::predecessor_account_id();
-        let claim = self.external_claims.get(&who).copied().unwrap_or(0);
-        require!(claim > 0 && self.total_claims > 0, "no claim");
-        let entitled = mul_div(self.recovered_total, claim, self.total_claims).min(claim);
-        let paid = self.claim_paid.get(&who).copied().unwrap_or(0);
-        let due = entitled.saturating_sub(paid);
-        require!(due > 0, "nothing new to claim yet");
-        self.claim_paid.insert(who.clone(), paid + due);
-        emit("claim_paid", serde_json::json!({"account": who, "amount": due.to_string()}));
-        Promise::new(who).transfer(NearToken::from_yoctonear(due))
-    }
-
-    pub fn get_claim(&self, account: AccountId) -> serde_json::Value {
-        let claim = self.external_claims.get(&account).copied().unwrap_or(0);
-        let paid = self.claim_paid.get(&account).copied().unwrap_or(0);
-        serde_json::json!({"claim_yocto": claim.to_string(), "paid_yocto": paid.to_string()})
-    }
-
-    /// Timelocked: announce a new Chain Signatures path; it takes effect only
-    /// after 48h, so depositors who object can withdraw first.
-    pub fn propose_mpc_path(&mut self, path: String) {
-        require!(env::predecessor_account_id() == self.manager_account(), "strategy-NFT holder only");
-        let at = env::block_timestamp_ms() + MPC_ROTATION_DELAY_MS;
-        emit("mpc_path_proposed", serde_json::json!({"path": path, "effective_at_ms": at}));
-        self.pending_mpc_path = Some((path, at));
-    }
-
-    /// Anyone can finalize once the delay has passed.
-    pub fn apply_mpc_path(&mut self) {
-        let (path, at) = self.pending_mpc_path.clone().unwrap_or_else(|| env::panic_str("nothing pending"));
+    /// Anyone may apply once the 48h timelock has passed. This is the only
+    /// way an integrity alert is cleared: deliberately, publicly, late.
+    pub fn apply_strategy(&mut self) {
+        let (h, u, at) = self.pending_strategy.clone().unwrap_or_else(|| env::panic_str("nothing pending"));
         require!(env::block_timestamp_ms() >= at, "timelock not elapsed");
-        emit("mpc_path_rotated", serde_json::json!({"old": self.mpc_path, "new": path}));
-        self.mpc_path = path;
-        self.pending_mpc_path = None;
-    }
-
-    // ------------------------------------------------------------------
-    // Admin (owner) — minimal by design
-    // ------------------------------------------------------------------
-
-    /// Rotating the strategy is allowed but *loud*: it clears nothing and is
-    /// logged, so the leaderboard shows a code change. Right belongs to the
-    /// strategy-NFT holder.
-    pub fn approve_new_wasm_hash(&mut self, wasm_hash: String, wasm_url: Option<String>) {
-        require!(
-            env::predecessor_account_id() == self.manager_account(),
-            "only the strategy-NFT holder may rotate the code"
-        );
-        require!(
-            wasm_hash.len() == 64 && hex::decode(&wasm_hash).is_ok(),
-            "wasm_hash must be 32 bytes hex"
-        );
-        emit(
-            "strategy_rotated",
-            serde_json::json!({"old": self.approved_wasm_hash, "new": wasm_hash, "url": wasm_url}),
-        );
-        self.approved_wasm_hash = wasm_hash;
-        if let Some(u) = wasm_url {
-            self.strategy_wasm_url = u;
-        }
+        emit("strategy_rotated", serde_json::json!({"old": self.approved_wasm_hash, "new": h}));
+        self.approved_wasm_hash = h;
+        self.strategy_wasm_url = u;
+        self.pending_strategy = None;
         self.integrity_alert = None;
-        self.deposits_paused = false;
+        if !self.emergency {
+            self.deposits_paused = false;
+        }
     }
 
-    // ------------------------------------------------------------------
-    // Views
-    // ------------------------------------------------------------------
-
-    pub fn get_summary(&self) -> serde_json::Value {
-        serde_json::json!({
-            "owner": self.owner,
-            "executor": self.executor,
-            "approved_wasm_hash": self.approved_wasm_hash,
-            "guardrails": self.guardrails,
-            "total_shares": self.total_shares.to_string(),
-            "pool_yocto": self.pool.to_string(),
-            "external_value_yocto": self.external_value.to_string(),
-            "nav_yocto": self.nav().to_string(),
-            "last_settlement_ref": self.last_settlement_ref,
-            "strategy_wasm_url": self.strategy_wasm_url,
-            "hwm_nav_per_share": self.hwm_nav_per_share.to_string(),
-            "last_attested_ms": self.last_attested_ms,
-            "liveness_timeout_ms": self.liveness_timeout_ms,
-            "stale": self.is_stale(),
-            "emergency": self.emergency,
-            "total_claims_yocto": self.total_claims.to_string(),
-            "recovered_total_yocto": self.recovered_total.to_string(),
-            "mpc_path": self.mpc_path,
-            "pending_mpc_path": self.pending_mpc_path,
-            "commitments": self.commitments.len(),
-            "risk_proofs": self.risk_proofs.len(),
-            "integrity_alert": self.integrity_alert,
-            "deposits_paused": self.deposits_paused,
-        })
+    pub fn propose_wallet(&mut self, mpc_path: String, evm_address: String) {
+        self.assert_manager();
+        parse_evm_address(&evm_address);
+        require!(mpc_path.len() <= 64, "path too long");
+        let at = env::block_timestamp_ms() + ROTATION_DELAY_MS;
+        emit("wallet_proposed", serde_json::json!({"path": mpc_path, "evm_address": evm_address, "effective_at_ms": at}));
+        self.pending_wallet = Some((mpc_path, evm_address, at));
     }
 
-    pub fn get_shares(&self, account: AccountId) -> U128 {
-        U128(self.shares.get(&account).copied().unwrap_or(0))
+    pub fn apply_wallet(&mut self) {
+        let (p, a, at) = self.pending_wallet.clone().unwrap_or_else(|| env::panic_str("nothing pending"));
+        require!(env::block_timestamp_ms() >= at, "timelock not elapsed");
+        emit("wallet_rotated", serde_json::json!({"old": self.evm_address, "new": a, "path": p}));
+        self.mpc_path = p;
+        self.evm_address = a;
+        self.pending_wallet = None;
     }
 
-    pub fn get_commitment(&self, id: u64) -> Option<TradeCommitment> {
-        self.commitments.get(id as u32).cloned()
-    }
+    // ==================================================================
+    // Fees
+    // ==================================================================
 
-    pub fn get_commitments(&self, from: u64, limit: u64) -> Vec<TradeCommitment> {
-        (from..(from + limit).min(self.commitments.len() as u64))
-            .filter_map(|i| self.commitments.get(i as u32).cloned())
-            .collect()
-    }
-
-    pub fn get_risk_proofs(&self, from: u64, limit: u64) -> Vec<StoredRiskProof> {
-        (from..(from + limit).min(self.risk_proofs.len() as u64))
-            .filter_map(|i| self.risk_proofs.get(i as u32).cloned())
-            .collect()
-    }
-
-    /// Public NAV history: every pool change, timestamped. This is what the
-    /// leaderboard charts and what returns are computed from.
-    pub fn get_nav_history(&self, from: u64, limit: u64) -> Vec<serde_json::Value> {
-        (from..(from + limit).min(self.nav_log.len() as u64))
-            .filter_map(|i| self.nav_log.get(i as u32))
-            .map(|p| serde_json::json!({"t": p.ts_ms, "pool_yocto": p.pool_yocto.to_string()}))
-            .collect()
-    }
-
-    /// Everything a third party needs to verify this vault independently.
-    pub fn get_verification_info(&self) -> serde_json::Value {
-        serde_json::json!({
-            "approved_wasm_hash": self.approved_wasm_hash,
-            "outlayer_register_contract": "worker.outlayer.testnet",
-            "attestation_api": "https://testnet-api.outlayer.ai",
-            "how": [
-                "1. fetch the OutLayer attestation by attestation_ref; check the TDX quote and that is_measurements_approved on the register contract",
-                "2. check the quote's wasm hash equals approved_wasm_hash",
-                "3. recompute sha256(revealed decision || salt) and compare to the on-chain commitment and its block height",
-                "4. verify the epoch Bulletproof bundles in your browser (vault-proofs wasm)"
-            ],
-        })
-    }
-
-    // ------------------------------------------------------------------
-
-    /// Mint the manager's performance fee as shares for any gain above the
-    /// high-water mark, then raise the mark. Callable by anyone; also runs
-    /// automatically before every deposit and withdrawal, so fees can never
-    /// be charged twice for the same gain.
+    /// Mint the manager's fee as shares for gain above the high-water mark.
+    /// Only on a valuation that has stood for 24h (a pumped settlement can't
+    /// be cashed into fees before anyone can see it), and never in emergency.
     pub fn crystallize_fees(&mut self) -> U128 {
+        if self.emergency || self.total_shares == 0 || self.perf_fee_bps == 0 {
+            return U128(0);
+        }
+        if self.ext_value > 0 && env::block_timestamp_ms() < self.last_settlement_ms + FEE_SETTLEMENT_AGE_MS {
+            return U128(0);
+        }
         let nav = self.nav();
-        if self.total_shares == 0 || nav == 0 || self.perf_fee_bps == 0 {
+        if nav == 0 {
             return U128(0);
         }
         let nps = mul_div(nav, NPS_SCALE, self.total_shares);
         if nps <= self.hwm_nav_per_share {
             return U128(0);
         }
-        // fee value = fee_bps of the gain since the mark, over all shares
         let gain_per_share = nps - self.hwm_nav_per_share;
-        let fee_value = mul_div(
-            mul_div(gain_per_share, self.total_shares, NPS_SCALE),
-            u128::from(self.perf_fee_bps),
-            10_000,
-        );
+        let fee_value = mul_div(mul_div(gain_per_share, self.total_shares, NPS_SCALE), u128::from(self.perf_fee_bps), 10_000);
         if fee_value == 0 {
             self.hwm_nav_per_share = nps;
             return U128(0);
         }
-        // mint shares that dilute everyone by exactly fee_value:
-        // fee_shares = total * f/(1-f), f = fee_value/pool  (fixed point)
         let f = mul_div(fee_value, NPS_SCALE, nav);
         let fee_shares = mul_div(self.total_shares, f, NPS_SCALE - f);
         if fee_shares > 0 {
-            let manager = self.manager_account();
-            let cur = self.shares.get(&manager).copied().unwrap_or(0);
-            self.shares.insert(manager.clone(), cur + fee_shares);
+            let m = self.manager_account();
+            let cur = self.shares.get(&m).copied().unwrap_or(0);
+            self.shares.insert(m.clone(), cur + fee_shares);
             self.total_shares += fee_shares;
-            emit(
-                "fees_crystallized",
-                serde_json::json!({
-                    "manager": manager,
-                    "fee_shares": fee_shares.to_string(),
-                    "fee_value_yocto": fee_value.to_string(),
-                }),
-            );
+            emit("fees_crystallized", serde_json::json!({"manager": m, "fee_shares": fee_shares.to_string(), "fee_value_yocto": fee_value.to_string()}));
         }
-        // the mark moves to the new NAV/share (post-dilution)
         self.hwm_nav_per_share = mul_div(self.nav(), NPS_SCALE, self.total_shares);
         U128(fee_shares)
     }
 
-    /// Who earns fees and may rotate the strategy: the strategy-NFT holder.
-    fn manager_account(&self) -> AccountId {
-        self.nft
-            .owner_by_id
-            .get(&STRATEGY_TOKEN_ID.to_string())
-            .unwrap_or_else(|| self.owner.clone())
+    // ==================================================================
+    // Views
+    // ==================================================================
+
+    /// Shareholders' part of the cross-chain wallet.
+    pub fn holders_ext_value(&self) -> u128 {
+        if self.ext_units_total == 0 { 0 } else { mul_div(self.ext_value, self.vault_ext_units, self.ext_units_total) }
     }
 
-    /// Public view of the current manager (= NFT holder).
+    /// NAV attributable to shareholders: NEAR pool + their external units.
+    pub fn nav(&self) -> u128 {
+        self.pool + self.holders_ext_value()
+    }
+
+    pub fn get_summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "version": EVENT_VERSION,
+            "owner": self.owner,
+            "executor": self.executor,
+            "manager": self.manager_account(),
+            "approved_wasm_hash": self.approved_wasm_hash,
+            "strategy_wasm_url": self.strategy_wasm_url,
+            "guardrails": self.guardrails,
+            "total_shares": self.total_shares.to_string(),
+            "pool_yocto": self.pool.to_string(),
+            "ext_value_yocto": self.ext_value.to_string(),
+            "external_value_yocto": self.holders_ext_value().to_string(),
+            "nav_yocto": self.nav().to_string(),
+            "ext_units_total": self.ext_units_total.to_string(),
+            "vault_ext_units": self.vault_ext_units.to_string(),
+            "repatriated_total_yocto": self.repatriated_total.to_string(),
+            "ext_paid_total_yocto": self.ext_paid_total.to_string(),
+            "last_settlement_ref": self.last_settlement_ref,
+            "last_settlement_ms": self.last_settlement_ms,
+            "hwm_nav_per_share": self.hwm_nav_per_share.to_string(),
+            "last_attested_ms": self.last_attested_ms,
+            "liveness_timeout_ms": self.liveness_timeout_ms,
+            "stale": self.is_stale(),
+            "emergency": self.emergency,
+            "mpc_path": self.mpc_path,
+            "evm_address": self.evm_address,
+            "pending_wallet": self.pending_wallet,
+            "pending_strategy": self.pending_strategy,
+            "commitments": self.commitments.len(),
+            "risk_proofs": self.risk_proofs.len(),
+            "integrity_alert": self.integrity_alert,
+            "deposits_paused": self.deposits_paused,
+            "min_deposit_yocto": MIN_DEPOSIT.to_string(),
+        })
+    }
+
+    pub fn get_shares(&self, account: AccountId) -> U128 {
+        U128(self.shares.get(&account).copied().unwrap_or(0))
+    }
+    pub fn get_commitment(&self, id: u64) -> Option<TradeCommitment> {
+        self.commitments.get(id as u32).cloned()
+    }
+    pub fn get_commitments(&self, from: u64, limit: u64) -> Vec<TradeCommitment> {
+        (from..(from + limit).min(self.commitments.len() as u64)).filter_map(|i| self.commitments.get(i as u32).cloned()).collect()
+    }
+    pub fn get_risk_proofs(&self, from: u64, limit: u64) -> Vec<StoredRiskProof> {
+        (from..(from + limit).min(self.risk_proofs.len() as u64)).filter_map(|i| self.risk_proofs.get(i as u32).cloned()).collect()
+    }
+    /// Chronological NAV history (ring buffer of the last NAV_LOG_CAP points).
+    pub fn get_nav_history(&self, from: u64, limit: u64) -> Vec<serde_json::Value> {
+        let len = self.nav_log.len();
+        let start = if len < NAV_LOG_CAP { 0 } else { self.nav_log_head };
+        (from..(from + limit).min(len as u64))
+            .filter_map(|i| self.nav_log.get((start + i as u32) % len.max(1)))
+            .map(|p| serde_json::json!({"t": p.ts_ms, "pool_yocto": p.pool_yocto.to_string()}))
+            .collect()
+    }
     pub fn get_manager(&self) -> AccountId {
         self.manager_account()
     }
 
-    /// Total NAV: local pool plus settled cross-chain value.
-    pub fn nav(&self) -> u128 {
-        self.pool + self.external_value
+    // ------------------------------------------------------------------
+
+    fn manager_account(&self) -> AccountId {
+        self.nft.owner_by_id.get(&STRATEGY_TOKEN_ID.to_string()).unwrap_or_else(|| self.owner.clone())
+    }
+    fn assert_manager(&self) {
+        require!(env::predecessor_account_id() == self.manager_account(), "strategy-NFT holder only");
+    }
+    fn assert_executor(&self) {
+        require!(env::predecessor_account_id() == self.executor, "only the registered executor may relay attested decisions");
     }
 
     fn record_nav(&mut self) {
-        self.nav_log.push(NavPoint {
-            ts_ms: env::block_timestamp_ms(),
-            pool_yocto: self.nav(),
-        });
+        let p = NavPoint { ts_ms: env::block_timestamp_ms(), pool_yocto: self.nav() };
+        if self.nav_log.len() < NAV_LOG_CAP {
+            self.nav_log.push(p);
+        } else {
+            self.nav_log.set(self.nav_log_head, p);
+            self.nav_log_head = (self.nav_log_head + 1) % NAV_LOG_CAP;
+        }
     }
 
-    /// The enclave's input must describe THIS vault as it is right now:
-    /// pool, shares, high-water mark, settled external value, guardrails.
-    /// Otherwise the executor could flatter the risk proof with fake NAV.
     fn check_input_state(&self, input_json: &str) -> Result<(), String> {
-        let v: serde_json::Value =
-            serde_json::from_str(input_json).map_err(|_| "input_json is not JSON".to_string())?;
+        let v: serde_json::Value = serde_json::from_str(input_json).map_err(|_| "input_json is not JSON".to_string())?;
         let Some(vs) = v.get("vault_state") else {
             return Err("input_json has no vault_state: risk would not be bound to real positions".into());
         };
@@ -1000,7 +1155,7 @@ impl Vault {
             ("pool_yocto", self.pool.to_string()),
             ("total_shares", self.total_shares.to_string()),
             ("hwm_nps", self.hwm_nav_per_share.to_string()),
-            ("external_value_yocto", self.external_value.to_string()),
+            ("external_value_yocto", self.holders_ext_value().to_string()),
         ];
         for (k, w) in want {
             let got = vs.get(k).and_then(|x| x.as_str()).unwrap_or("");
@@ -1016,13 +1171,6 @@ impl Vault {
         Ok(())
     }
 
-    fn assert_executor(&self) {
-        require!(
-            env::predecessor_account_id() == self.executor,
-            "only the registered executor may relay attested decisions"
-        );
-    }
-
     fn check_guardrails(&self, d: &Decision) -> Result<(), String> {
         if !matches!(d.action.as_str(), "buy" | "sell" | "hold") {
             return Err(format!("unknown action '{}'", d.action));
@@ -1031,16 +1179,10 @@ impl Vault {
             return Ok(());
         }
         if d.leverage_bps > self.guardrails.max_leverage_bps {
-            return Err(format!(
-                "leverage {}bps exceeds max {}bps",
-                d.leverage_bps, self.guardrails.max_leverage_bps
-            ));
+            return Err(format!("leverage {}bps exceeds max {}bps", d.leverage_bps, self.guardrails.max_leverage_bps));
         }
         if d.size_bps > self.guardrails.max_position_bps {
-            return Err(format!(
-                "position {}bps of NAV exceeds max {}bps",
-                d.size_bps, self.guardrails.max_position_bps
-            ));
+            return Err(format!("position {}bps of NAV exceeds max {}bps", d.size_bps, self.guardrails.max_position_bps));
         }
         if !self.guardrails.allowed_pairs.iter().any(|p| p == &d.pair) {
             return Err(format!("pair '{}' not in allowlist", d.pair));
@@ -1050,11 +1192,10 @@ impl Vault {
 }
 
 // ---------------------------------------------------------------------------
-// State migration v2 -> v3 (adds exit-guarantee fields). Deployed atomically
-// with the code: deploy + migrate in one tx.
+// Migration v3 -> v4. Deployed atomically with the code.
 // ---------------------------------------------------------------------------
 #[near(serializers = [borsh])]
-pub struct VaultV2 {
+pub struct VaultV3 {
     owner: AccountId,
     executor: AccountId,
     approved_wasm_hash: String,
@@ -1074,59 +1215,67 @@ pub struct VaultV2 {
     deposits_paused: bool,
     nft: NonFungibleToken,
     nft_metadata: LazyOption<NFTContractMetadata>,
+    last_attested_ms: u64,
+    liveness_timeout_ms: u64,
+    emergency: bool,
+    external_claims: LookupMap<AccountId, u128>,
+    claim_paid: LookupMap<AccountId, u128>,
+    total_claims: u128,
+    recovered_total: u128,
+    mpc_path: String,
+    pending_mpc_path: Option<(String, u64)>,
 }
 
 #[near]
 impl Vault {
     #[private]
     #[init(ignore_state)]
-    pub fn migrate_v3() -> Self {
-        let o: VaultV2 = env::state_read().expect("no v2 state to migrate");
-        emit("migrated", serde_json::json!({"to": "v3"}));
+    pub fn migrate_v4(mpc_path: String, evm_address: String) -> Self {
+        let o: VaultV3 = env::state_read().expect("no v3 state to migrate");
+        require!(o.total_claims == 0, "v3 claims outstanding: migrate them first");
+        parse_evm_address(&evm_address);
+        let units = if o.external_value > 0 { EXT_UNITS_BASE } else { 0 };
+        emit("migrated", serde_json::json!({"to": "v4", "ext_units": units.to_string()}));
         Self {
-            owner: o.owner, executor: o.executor, approved_wasm_hash: o.approved_wasm_hash,
-            guardrails: o.guardrails, total_shares: o.total_shares, shares: o.shares,
-            pool: o.pool, external_value: o.external_value,
-            last_settlement_ref: o.last_settlement_ref, strategy_wasm_url: o.strategy_wasm_url,
-            commitments: o.commitments, risk_proofs: o.risk_proofs, nav_log: o.nav_log,
-            perf_fee_bps: o.perf_fee_bps, hwm_nav_per_share: o.hwm_nav_per_share,
-            integrity_alert: o.integrity_alert, deposits_paused: o.deposits_paused,
-            nft: o.nft, nft_metadata: o.nft_metadata,
-            last_attested_ms: env::block_timestamp_ms(),
-            liveness_timeout_ms: DEFAULT_LIVENESS_MS,
-            emergency: false,
-            external_claims: LookupMap::new(StorageKey::Claims),
-            claim_paid: LookupMap::new(StorageKey::ClaimPaid),
-            total_claims: 0,
-            recovered_total: 0,
-            mpc_path: "alpha-vault-v1".into(),
-            pending_mpc_path: None,
+            owner: o.owner,
+            executor: o.executor,
+            approved_wasm_hash: o.approved_wasm_hash,
+            guardrails: o.guardrails,
+            total_shares: o.total_shares,
+            shares: o.shares,
+            pool: o.pool,
+            ext_value: o.external_value,
+            last_settlement_ref: o.last_settlement_ref,
+            last_settlement_ms: 0,
+            strategy_wasm_url: o.strategy_wasm_url,
+            commitments: o.commitments,
+            risk_proofs: o.risk_proofs,
+            nav_log: o.nav_log,
+            nav_log_head: 0,
+            perf_fee_bps: o.perf_fee_bps,
+            hwm_nav_per_share: o.hwm_nav_per_share,
+            integrity_alert: o.integrity_alert,
+            deposits_paused: o.deposits_paused,
+            nft: o.nft,
+            nft_metadata: o.nft_metadata,
+            last_attested_ms: o.last_attested_ms,
+            liveness_timeout_ms: o.liveness_timeout_ms,
+            emergency: o.emergency,
+            ext_units_total: units,
+            vault_ext_units: units,
+            ext_units: LookupMap::new(StorageKey::ExtUnits),
+            ext_debt: LookupMap::new(StorageKey::ExtDebt),
+            ext_pending: LookupMap::new(StorageKey::ExtPending),
+            ext_acc: 0,
+            repatriated_total: 0,
+            ext_paid_total: 0,
+            mpc_path,
+            evm_address,
+            pending_wallet: None,
+            pending_strategy: None,
+            signed_legs: LookupMap::new(StorageKey::SignedLegs),
+            failed_payouts: LookupMap::new(StorageKey::FailedPayouts),
         }
-    }
-}
-
-#[near]
-impl Vault {
-    /// One-time repair (deployed atomically with the mul_div fix): the live
-    /// vault's first settlement minted seed shares through the overflowing
-    /// u128 path (29.6e24 × 1e24 saturated). Recompute the seed mint exactly as
-    /// the fixed code would have, from state that has not moved since.
-    /// #[private] = only the contract account itself, inside the upgrade tx.
-    #[private]
-    pub fn repair_seed_mint(&mut self, bad_minted: U128) {
-        let m = self.manager_account();
-        let held = self.shares.get(&m).copied().unwrap_or(0);
-        require!(held >= bad_minted.0, "bad_minted exceeds manager balance");
-        let shares_before = self.total_shares - bad_minted.0;
-        let nav_before = self.pool; // local NAV at seed time (no flows since)
-        let correct = mul_div(self.external_value, shares_before, nav_before);
-        self.shares.insert(m.clone(), held - bad_minted.0 + correct);
-        self.total_shares = shares_before + correct;
-        self.hwm_nav_per_share = mul_div(self.nav(), NPS_SCALE, self.total_shares);
-        emit(
-            "repaired_seed_mint",
-            serde_json::json!({"manager": m, "bad": bad_minted.0.to_string(), "correct": correct.to_string()}),
-        );
     }
 }
 
@@ -1142,468 +1291,4 @@ impl NonFungibleTokenMetadataProvider for Vault {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use near_sdk::test_utils::{get_logs, VMContextBuilder};
-    use near_sdk::testing_env;
-
-    fn owner() -> AccountId {
-        "amudhan.testnet".parse().unwrap()
-    }
-    fn executor() -> AccountId {
-        "executor.testnet".parse().unwrap()
-    }
-    fn investor() -> AccountId {
-        "alice.testnet".parse().unwrap()
-    }
-    const WASM_HASH: &str = "c3b8b92a101e575d1c0e2e502c1fc21443fa0e08e864e84fe467d5840bda9f77";
-
-    fn guardrails() -> Guardrails {
-        Guardrails {
-            max_leverage_bps: 30_000,
-            max_drawdown_bps: 2_000,
-            max_position_bps: 5_000,
-            allowed_pairs: vec!["ETH/USDC".into(), "NEAR/USDC".into()],
-        }
-    }
-
-    fn ctx(pred: AccountId, deposit_yocto: u128) {
-        testing_env!(VMContextBuilder::new()
-            .predecessor_account_id(pred)
-            .attached_deposit(NearToken::from_yoctonear(deposit_yocto))
-            .build());
-    }
-
-    fn new_vault() -> Vault {
-        Vault::new(owner(), executor(), WASM_HASH.into(), "https://test.fastfs.io/demo.wasm".into(), guardrails())
-    }
-
-    fn decision_json(action: &str, leverage_bps: u64, size_bps: u64, pair: &str) -> String {
-        serde_json::json!({
-            "action": action, "pair": pair, "size_bps": size_bps,
-            "leverage_bps": leverage_bps, "epoch": 1, "nonce": 7
-        })
-        .to_string()
-    }
-
-    /// commitment = sha256(decision_json || salt), like the TEE computes it.
-    fn commit_of(decision_json: &str, salt: &[u8]) -> String {
-        use near_sdk::env::sha256;
-        let mut pre = decision_json.as_bytes().to_vec();
-        pre.extend_from_slice(salt);
-        hex::encode(sha256(&pre))
-    }
-
-    #[test]
-    fn deposit_and_withdraw_share_math() {
-        let mut v = new_vault();
-        ctx(investor(), 100);
-        assert_eq!(v.deposit().0, 100); // first depositor: 1:1
-        ctx(owner(), 300);
-        assert_eq!(v.deposit().0, 300);
-        assert_eq!(v.total_shares, 400);
-        assert_eq!(v.pool, 400);
-
-        // vault gains 100 PnL -> pool 500. On withdraw, the 20% performance
-        // fee on the gain crystallizes first (manager is diluted in, ~16
-        // shares worth ~20), then alice exits at the post-fee NAV/share.
-        v.pool += 100;
-        ctx(investor(), 0);
-        let _ = v.withdraw(U128(100));
-        assert_eq!(v.get_shares(investor()).0, 0);
-        // owner holds their 300 deposit shares + ~16 fee shares; alice exited
-        // with ~120 (125 pre-fee minus her slice of the 20-yocto fee)
-        let manager_shares = v.get_shares(owner()).0;
-        assert!((315..=317).contains(&manager_shares), "300 deposit + ~16 fee shares, got {manager_shares}");
-        assert!((379..=381).contains(&v.pool), "pool after alice's ~120 exit, got {}", v.pool);
-        // every pool change is in the public NAV log
-        let hist = v.get_nav_history(0, 10);
-        assert_eq!(hist.len(), 3);
-    }
-
-    const NEAR: u128 = 1_000_000_000_000_000_000_000_000;
-
-    #[test]
-    fn share_math_at_real_yocto_scale() {
-        // the bug: second 1-NEAR deposit overflowed u128 in amount*total_shares
-        let mut v = new_vault();
-        ctx(investor(), NEAR);
-        v.deposit();
-        ctx(owner(), NEAR);
-        assert_eq!(v.deposit().0, NEAR, "second depositor at NAV/share 1.0 gets 1:1");
-        // 50% gain, then withdraw everything: fee ≈ 20% of 1 NEAR gain
-        v.pool += NEAR;
-        ctx(investor(), 0);
-        let _ = v.withdraw(U128(NEAR));
-        let fee_shares = v.get_shares(owner()).0 - NEAR;
-        let fee_value = mul_div(v.nav(), fee_shares, v.total_shares);
-        let want = NEAR / 5;
-        assert!(fee_value.abs_diff(want) < want / 1000, "fee {fee_value} vs ~{want}");
-    }
-
-    #[test]
-    fn seed_capital_at_real_scale() {
-        let mut v = new_vault();
-        ctx(owner(), NEAR);
-        v.deposit();
-        ctx(executor(), 0);
-        v.settle_pnl(U128(29 * NEAR + NEAR / 2), 1, "att".into());
-        // NAV/share stays exactly 1.0
-        assert_eq!(mul_div(v.nav(), NPS_SCALE, v.total_shares), NPS_SCALE);
-        assert_eq!(v.get_shares(owner()).0, 30 * NEAR + NEAR / 2);
-    }
-
-    #[test]
-    fn repair_recomputes_a_saturated_seed_mint() {
-        let mut v = new_vault();
-        ctx(owner(), NEAR);
-        v.deposit();
-        // simulate the live bug's outcome: seed booked, shares mis-minted
-        let bad = u128::MAX / NEAR;
-        v.external_value = 29 * NEAR;
-        v.total_shares += bad;
-        let held = v.get_shares(owner()).0;
-        v.shares.insert(owner(), held + bad);
-        ctx("vault.testnet".parse().unwrap(), 0);
-        testing_env!(VMContextBuilder::new()
-            .current_account_id("vault.testnet".parse().unwrap())
-            .predecessor_account_id("vault.testnet".parse().unwrap())
-            .build());
-        v.repair_seed_mint(U128(bad));
-        assert_eq!(v.total_shares, 30 * NEAR);
-        assert_eq!(mul_div(v.nav(), NPS_SCALE, v.total_shares), NPS_SCALE);
-    }
-
-    #[test]
-    fn first_settlement_is_seed_capital_not_performance() {
-        let mut v = new_vault();
-        ctx(investor(), 1_000);
-        v.deposit();
-        ctx(executor(), 0);
-        // owner funded the cross-chain wallet with 29_000 out-of-band
-        v.settle_pnl(U128(29_000), 1, "att".into());
-        // NAV/share unchanged: no fake return, no fee
-        assert_eq!(v.nav() * 1_000 / v.total_shares, 1_000);
-        assert_eq!(v.get_shares(owner()).0, 29_000);
-        assert_eq!(v.get_shares(investor()).0, 1_000);
-    }
-
-    #[test]
-    fn settlement_moves_nav_and_share_price() {
-        let mut v = new_vault();
-        ctx(investor(), 1_000);
-        v.deposit();
-        // 600 of the pool goes cross-chain (bridged by the vault itself, so
-        // first record it at cost), then a later settlement shows it grew to 700
-        ctx(executor(), 0);
-        v.last_settlement_ref = Some("bridge".into());
-        v.pool -= 600;
-        v.external_value = 600;
-        v.settle_pnl(U128(700), 123, "att-x".into());
-        assert_eq!(v.nav(), 1_100);
-        // a new depositor pays the higher NAV/share
-        ctx(owner(), 1_100);
-        let minted = v.deposit().0;
-        // 20% fee on the 100 gain crystallized first, so slightly > 1000*1100/1100
-        assert!(minted >= 1_000 && minted <= 1_020, "got {minted}");
-        // only the executor may settle
-        ctx(investor(), 0);
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            v.settle_pnl(U128(1), 1, "x".into())
-        }));
-        assert!(res.is_err());
-    }
-
-    fn ctx_at(pred: AccountId, deposit: u128, ts_ms: u64) {
-        testing_env!(VMContextBuilder::new()
-            .predecessor_account_id(pred)
-            .attached_deposit(NearToken::from_yoctonear(deposit))
-            .block_timestamp(ts_ms * 1_000_000)
-            .build());
-    }
-
-    fn state_input(v: &Vault) -> String {
-        serde_json::json!({"vault_state": {
-            "pool_yocto": v.pool.to_string(), "total_shares": v.total_shares.to_string(),
-            "hwm_nps": v.hwm_nav_per_share.to_string(), "external_value_yocto": v.external_value.to_string(),
-            "max_leverage_bps": 30_000, "max_drawdown_bps": 2_000 }}).to_string()
-    }
-
-    #[test]
-    fn commit_rejects_doctored_vault_state() {
-        let mut v = new_vault();
-        ctx(investor(), 1_000);
-        v.deposit();
-        ctx(executor(), 0);
-        // honest input lands
-        v.commit_decision("a".repeat(64), WASM_HASH.into(), "x".into(), Some(state_input(&v)));
-        // executor inflates the pool to hide a drawdown -> refused
-        let mut fake: serde_json::Value = serde_json::from_str(&state_input(&v)).unwrap();
-        fake["vault_state"]["pool_yocto"] = serde_json::json!("999999");
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            v.commit_decision("b".repeat(64), WASM_HASH.into(), "x".into(), Some(fake.to_string()))
-        }));
-        assert!(r.is_err());
-        // input without vault_state -> refused
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            v.commit_decision("c".repeat(64), WASM_HASH.into(), "x".into(), Some("{}".into()))
-        }));
-        assert!(r.is_err());
-    }
-
-    #[test]
-    fn emergency_needs_staleness_and_is_permissionless() {
-        let mut v = new_vault();
-        let stranger: AccountId = "anyone.testnet".parse().unwrap();
-        ctx_at(stranger.clone(), 0, 1_000);
-        let live = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| v.trigger_emergency()));
-        assert!(live.is_err(), "cannot trigger while live");
-        ctx_at(stranger, 0, DEFAULT_LIVENESS_MS + 10_000);
-        v.trigger_emergency();
-        assert!(v.emergency && v.deposits_paused);
-        // trading is frozen
-        ctx_at(executor(), 0, DEFAULT_LIVENESS_MS + 20_000);
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            v.commit_decision("a".repeat(64), WASM_HASH.into(), "x".into(), None)
-        }));
-        assert!(r.is_err());
-    }
-
-    #[test]
-    fn emergency_withdraw_pays_local_and_records_fair_claims() {
-        let mut v = new_vault();
-        ctx_at(investor(), 1_000, 0);
-        v.deposit();
-        ctx_at(owner(), 3_000, 0);
-        v.deposit();
-        // 2_000 of the 4_000 went cross-chain
-        v.pool -= 2_000;
-        v.external_value = 2_000;
-        ctx_at(investor(), 0, DEFAULT_LIVENESS_MS + 1);
-        v.trigger_emergency();
-        let _ = v.withdraw(U128(1_000)); // alice: 25%
-        assert_eq!(v.pool, 1_500, "alice got 500 local");
-        assert_eq!(v.get_claim(investor())["claim_yocto"], "500");
-        // half the cross-chain value is recovered
-        ctx_at(owner(), 1_000, DEFAULT_LIVENESS_MS + 2);
-        v.deposit_recovered();
-        ctx_at(owner(), 0, DEFAULT_LIVENESS_MS + 3);
-        let _ = v.withdraw(U128(3_000)); // owner exits too: claim 1_500
-        // claims: alice 500, owner 1500; recovered 1000 -> alice 250, owner 750
-        ctx_at(investor(), 0, DEFAULT_LIVENESS_MS + 4);
-        let _ = v.claim_recovered();
-        assert_eq!(v.get_claim(investor())["paid_yocto"], "250");
-        let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| v.claim_recovered()));
-        assert!(again.is_err(), "no double claim");
-    }
-
-    #[test]
-    fn mpc_rotation_is_timelocked() {
-        let mut v = new_vault();
-        ctx_at(owner(), 0, 0);
-        v.propose_mpc_path("alpha-vault-v2".into());
-        ctx_at(investor(), 0, MPC_ROTATION_DELAY_MS - 1);
-        let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| v.apply_mpc_path()));
-        assert!(early.is_err());
-        ctx_at(investor(), 0, MPC_ROTATION_DELAY_MS + 1);
-        v.apply_mpc_path();
-        assert_eq!(v.mpc_path, "alpha-vault-v2");
-    }
-
-    #[test]
-    fn strategy_nft_carries_manager_rights() {
-        let mut v = new_vault();
-        let bob: AccountId = "bob.testnet".parse().unwrap();
-        assert_eq!(v.get_manager(), owner());
-        assert_eq!(v.nft_token(STRATEGY_TOKEN_ID.into()).unwrap().owner_id, owner());
-
-        // alice invests; the vault gains; nobody crystallizes yet
-        ctx(investor(), 1_000_000);
-        v.deposit();
-        v.pool += 500_000;
-
-        // the manager sells the strategy NFT to bob (1 yocto per NEP-171)
-        ctx(owner(), 1);
-        v.nft_transfer(bob.clone(), STRATEGY_TOKEN_ID.into(), None, None);
-        assert_eq!(v.get_manager(), bob);
-
-        // fees now crystallize to bob, not the original owner
-        ctx(bob.clone(), 0);
-        assert!(v.crystallize_fees().0 > 0);
-        assert!(v.get_shares(bob.clone()).0 > 0);
-        assert_eq!(v.get_shares(owner()).0, 0);
-
-        // code rotation now belongs to bob...
-        ctx(bob.clone(), 0);
-        v.approve_new_wasm_hash("ab".repeat(32), None);
-        assert_eq!(v.approved_wasm_hash, "ab".repeat(32));
-
-        // ...and the old owner lost it
-        ctx(owner(), 0);
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            v.approve_new_wasm_hash("cd".repeat(32), None)
-        }));
-        assert!(res.is_err(), "previous owner must not rotate the code");
-    }
-
-    #[test]
-    fn performance_fee_respects_the_high_water_mark() {
-        let mut v = new_vault();
-        ctx(investor(), 1_000_000);
-        v.deposit();
-        // +50% gain -> fee = 20% of 500_000 = ~100_000 in value
-        v.pool += 500_000;
-        ctx(owner(), 0);
-        let minted = v.crystallize_fees().0;
-        assert!(minted > 0);
-        let manager_value = v.pool * v.get_shares(owner()).0 / v.total_shares;
-        assert!((99_000..=100_500).contains(&manager_value), "got {manager_value}");
-        // same NAV: crystallizing again charges nothing
-        assert_eq!(v.crystallize_fees().0, 0);
-        // drawdown below the mark, then partial recovery: still nothing
-        v.pool -= 300_000;
-        assert_eq!(v.crystallize_fees().0, 0);
-        v.pool += 200_000;
-        assert_eq!(v.crystallize_fees().0, 0, "no fee until the old mark is beaten");
-        // new high: fee only on the gain above the previous mark
-        v.pool += 250_000;
-        assert!(v.crystallize_fees().0 > 0);
-    }
-
-    #[test]
-    fn happy_path_commit_then_execute() {
-        let mut v = new_vault();
-        let d = decision_json("buy", 25_000, 4_000, "ETH/USDC");
-        let salt = b"random-tee-salt";
-        ctx(executor(), 0);
-        let id = v.commit_decision(commit_of(&d, salt), WASM_HASH.into(), "exec-123".into(), None);
-        v.execute_decision(id, d.clone(), hex::encode(salt));
-        let c = v.get_commitment(id).unwrap();
-        assert_eq!(c.status, CommitmentStatus::Executed);
-        assert_eq!(c.revealed.unwrap(), d);
-    }
-
-    #[test]
-    #[should_panic(expected = "was not committed when claimed")]
-    fn cheat_1_backfilled_trade_is_caught() {
-        // Manager commits one trade, then tries to reveal a *different*,
-        // winning trade against that commitment.
-        let mut v = new_vault();
-        let real = decision_json("buy", 25_000, 4_000, "ETH/USDC");
-        let fake_winner = decision_json("sell", 25_000, 4_000, "ETH/USDC");
-        let salt = b"salt";
-        ctx(executor(), 0);
-        let id = v.commit_decision(commit_of(&real, salt), WASM_HASH.into(), "exec-1".into(), None);
-        v.execute_decision(id, fake_winner, hex::encode(salt));
-    }
-
-    #[test]
-    #[should_panic(expected = "no such commitment")]
-    fn cheat_1b_trade_without_any_commitment() {
-        let mut v = new_vault();
-        ctx(executor(), 0);
-        v.execute_decision(0, decision_json("buy", 10_000, 100, "ETH/USDC"), "00".into());
-    }
-
-    #[test]
-    fn cheat_2_ten_x_leverage_is_refused_before_signing() {
-        let mut v = new_vault();
-        let greedy = decision_json("buy", 100_000, 4_000, "ETH/USDC"); // 10x
-        let salt = b"salt";
-        ctx(executor(), 0);
-        let id = v.commit_decision(commit_of(&greedy, salt), WASM_HASH.into(), "exec-2".into(), None);
-        v.execute_decision(id, greedy, hex::encode(salt));
-        let c = v.get_commitment(id).unwrap();
-        assert_eq!(c.status, CommitmentStatus::Rejected);
-        assert!(c.reject_reason.unwrap().contains("leverage 100000bps exceeds max 30000bps"));
-        assert!(get_logs().iter().any(|l| l.contains("guardrail_rejected")));
-    }
-
-    #[test]
-    fn cheat_2b_oversized_position_and_unlisted_pair_refused() {
-        let mut v = new_vault();
-        ctx(executor(), 0);
-        for d in [
-            decision_json("buy", 20_000, 9_000, "ETH/USDC"),  // 90% of NAV
-            decision_json("buy", 20_000, 1_000, "DOGE/USDC"), // not allowlisted
-        ] {
-            let salt = b"s";
-            let id = v.commit_decision(commit_of(&d, salt), WASM_HASH.into(), "x".into(), None);
-            v.execute_decision(id, d, hex::encode(salt));
-            assert_eq!(v.get_commitment(id).unwrap().status, CommitmentStatus::Rejected);
-        }
-    }
-
-    #[test]
-    fn cheat_3_swapped_code_pauses_deposits() {
-        let mut v = new_vault();
-        ctx(executor(), 0);
-        let evil_hash = "d".repeat(64);
-        let d = decision_json("buy", 10_000, 100, "ETH/USDC");
-        // recorded as Rejected, NOT a panic: a panic would revert the alert on-chain
-        let id = v.commit_decision(commit_of(&d, b"s"), evil_hash, "exec-3".into(), None);
-        let c = v.get_commitment(id).unwrap();
-        assert_eq!(c.status, CommitmentStatus::Rejected);
-        assert!(v.deposits_paused);
-        assert!(v.integrity_alert.is_some());
-        // and new deposits are now refused
-        ctx(investor(), 100);
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| v.deposit()));
-        assert!(res.is_err(), "deposits must be paused after integrity alert");
-    }
-
-    #[test]
-    #[should_panic(expected = "only the registered executor")]
-    fn random_account_cannot_commit() {
-        let mut v = new_vault();
-        ctx(investor(), 0);
-        v.commit_decision("a".repeat(64), WASM_HASH.into(), "x".into(), None);
-    }
-
-    #[test]
-    #[should_panic(expected = "commitment already settled")]
-    fn no_double_settlement() {
-        let mut v = new_vault();
-        let d = decision_json("buy", 25_000, 4_000, "ETH/USDC");
-        let salt = b"salt";
-        ctx(executor(), 0);
-        let id = v.commit_decision(commit_of(&d, salt), WASM_HASH.into(), "x".into(), None);
-        v.execute_decision(id, d.clone(), hex::encode(salt));
-        v.execute_decision(id, d, hex::encode(salt));
-    }
-
-    #[test]
-    fn risk_proof_limits_must_match_guardrails() {
-        let mut v = new_vault();
-        ctx(executor(), 0);
-        // limits match -> accepted
-        let good = serde_json::json!({
-            "epoch": 1,
-            "leverage": {"label":"leverage_bps","limit":30_000,"epoch":1,"commitment":"","proof":""},
-            "drawdown": {"label":"drawdown_bps","limit":2_000,"epoch":1,"commitment":"","proof":""},
-        })
-        .to_string();
-        v.post_risk_proof(1, good);
-        assert_eq!(v.get_risk_proofs(0, 10).len(), 1);
-        // looser leverage limit -> refused
-        let loose = serde_json::json!({
-            "epoch": 2,
-            "leverage": {"label":"leverage_bps","limit":60_000,"epoch":2,"commitment":"","proof":""},
-            "drawdown": {"label":"drawdown_bps","limit":2_000,"epoch":2,"commitment":"","proof":""},
-        })
-        .to_string();
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| v.post_risk_proof(2, loose)));
-        assert!(res.is_err());
-    }
-
-    #[test]
-    fn hold_decisions_skip_trade_guardrails() {
-        let mut v = new_vault();
-        let d = decision_json("hold", 0, 0, "ETH/USDC");
-        let salt = b"salt";
-        ctx(executor(), 0);
-        let id = v.commit_decision(commit_of(&d, salt), WASM_HASH.into(), "x".into(), None);
-        v.execute_decision(id, d, hex::encode(salt));
-        assert_eq!(v.get_commitment(id).unwrap().status, CommitmentStatus::Executed);
-    }
-}
+mod tests;

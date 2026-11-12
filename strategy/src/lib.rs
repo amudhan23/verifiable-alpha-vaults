@@ -98,6 +98,12 @@ pub struct RealRisk {
 
 const NPS_SCALE: f64 = 1e12;
 
+/// Prices must be finite and positive. A zero/NaN/negative price would zero
+/// out the risk metrics (audit M1); refuse instead.
+pub fn prices_ok(st: &SettleInput) -> bool {
+    st.eth_usd.is_finite() && st.near_usd.is_finite() && st.eth_usd > 0.0 && st.near_usd > 0.0
+}
+
 pub fn real_risk(vs: &VaultState, st: &SettleInput, decision: &Decision) -> RealRisk {
     let yocto = 1e24_f64;
     let pool = vs.pool_yocto.parse::<f64>().unwrap_or(0.0) / yocto;
@@ -240,8 +246,9 @@ pub fn run(params: &Params, input: &RunInput, salt: [u8; 32]) -> RunOutput {
 
     // Risk metrics: from ACTUAL positions when the vault state + balances
     // are in the input (live path); else from the decision (offline/legacy).
+    let bad_prices = input.settle.as_ref().map_or(false, |st| !prices_ok(st));
     let (run_leverage, dd, risk_basis) = match (&input.vault_state, &input.settle) {
-        (Some(vs), Some(st)) => {
+        (Some(vs), Some(st)) if !bad_prices => {
             let r = real_risk(vs, st, &decision);
             (r.leverage_bps, r.drawdown_bps, "positions")
         }
@@ -255,9 +262,13 @@ pub fn run(params: &Params, input: &RunInput, salt: [u8; 32]) -> RunOutput {
         max_leverage_bps: input.max_leverage_bps,
         max_drawdown_bps: input.max_drawdown_bps,
     };
-    let (risk_bundle, risk_error) = match prove_risk(input.epoch, run_leverage, dd, &limits) {
-        Ok(b) => (Some(b), None),
-        Err(e) => (None, Some(e.to_string())),
+    let (risk_bundle, risk_error) = if bad_prices {
+        (None, Some("invalid oracle prices (non-finite or non-positive): no risk proof".to_string()))
+    } else {
+        match prove_risk(input.epoch, run_leverage, dd, &limits) {
+            Ok(b) => (Some(b), None),
+            Err(e) => (None, Some(e.to_string())),
+        }
     };
 
     let sealed = Sealed { decision_json, salt_hex: hex::encode(salt) };
@@ -278,7 +289,7 @@ pub fn run(params: &Params, input: &RunInput, salt: [u8; 32]) -> RunOutput {
         None => (Some(sealed), None),
     };
 
-    let settlement = input.settle.as_ref().map(|st| {
+    let settlement = input.settle.as_ref().filter(|st| prices_ok(st)).map(|st| {
         let eth: f64 = st.eth_balance_wei.parse::<u128>().unwrap_or(0) as f64 / 1e18;
         let usdc: f64 = st.usdc_balance_6dp.parse::<u128>().unwrap_or(0) as f64 / 1e6;
         let usd = eth * st.eth_usd + usdc; // USDC at par
@@ -476,6 +487,20 @@ mod tests {
         let out = run(&params(), &inp, [1u8; 32]);
         assert!(out.risk_bundle.is_none());
         assert_eq!(out.risk_basis, "positions");
+    }
+
+    #[test]
+    fn bad_oracle_prices_yield_no_proof_and_no_settlement() {
+        let mut inp = input(rising());
+        inp.vault_state = Some(vs(10, 35, 1.0));
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut h = holdings(0.05, 0.0);
+            h.near_usd = bad;
+            inp.settle = Some(h);
+            let out = run(&params(), &inp, [1u8; 32]);
+            assert!(out.risk_bundle.is_none(), "price {bad} must not produce a proof");
+            assert!(out.settlement.is_none());
+        }
     }
 
     #[test]

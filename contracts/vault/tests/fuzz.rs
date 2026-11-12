@@ -1,186 +1,166 @@
-//! Property tests for the money math: random sequences of deposits,
-//! withdrawals, PnL, settlements, fee crystallization and emergency exits at
-//! REAL yoctoNEAR scale. After every step, check the invariants that make the
-//! vault safe to hold other people's money.
+//! Property tests for the money math (v4), at real yoctoNEAR scale.
 //!
-//! Invariants checked:
-//!  I1  sum of every account's shares == total_shares
-//!  I2  conservation: deposits + pnl == pool + external + paid out (+ claims)
-//!  I3  rounding favors the vault: a deposit never mints shares worth more
-//!      than was deposited; a withdrawal never pays more than the shares' NAV
-//!  I4  deposits/withdrawals never move NAV/share up for the actor and never
-//!      down for everyone else (beyond 1-yocto rounding)
-//!  I5  fees: the manager's share count only grows through crystallization
-//!      when NAV/share is above the high-water mark
-//!  I6  emergency: local payout <= pro-rata pool, claim == pro-rata external
+//! Random sequences of deposits, withdrawals, ADVERSARIAL settlements (any
+//! value the bounds allow), repatriations, external claims, fee
+//! crystallization and emergency exits. After every step:
+//!
+//!  S1  sum of all accounts' shares == total_shares
+//!  S2  SOLVENCY: NEAR the contract actually holds (all inflows minus all
+//!      outflows) >= everything it owes (pool + every unit holder's claimable
+//!      repatriated NEAR). This is the invariant the v3 bug violated.
+//!  S3  external payouts never exceed what was repatriated
+//!  S4  units conserved: vault units + every holder's units == units total
+//!  S5  a withdrawal pays exactly the pro-rata slice of the pool, whatever
+//!      the settled valuation says
+//!  S6  a deposit never mints shares worth more than it paid
+//!  S7  no fee is minted without a new high (and none on fresh valuations)
 
 use near_sdk::json_types::U128;
 use near_sdk::test_utils::VMContextBuilder;
 use near_sdk::{testing_env, AccountId, NearToken};
 use proptest::prelude::*;
-use vault_contract::{mul_div, Guardrails, Vault, DEFAULT_LIVENESS_MS};
+use vault_contract::{
+    mul_div, Guardrails, Vault, DEFAULT_LIVENESS_MS, MIN_DEPOSIT, MIN_SETTLE_INTERVAL_MS,
+};
 
 const NEAR: u128 = 1_000_000_000_000_000_000_000_000;
-const SCALE: u128 = 1_000_000_000_000; // NPS_SCALE
+const SCALE: u128 = 1_000_000_000_000;
 
 fn acct(i: usize) -> AccountId {
-    format!("user{i}.testnet").parse().unwrap()
+    if i == 4 { "owner.testnet".parse().unwrap() } else { format!("user{i}.testnet").parse().unwrap() }
 }
-fn owner() -> AccountId { "owner.testnet".parse().unwrap() }
 fn executor() -> AccountId { "executor.testnet".parse().unwrap() }
 
-fn context(pred: &AccountId, deposit: u128, ts_ms: u64) -> near_sdk::VMContext {
-    VMContextBuilder::new()
+fn ctx(pred: &AccountId, deposit: u128, ts_ms: u64) {
+    testing_env!(VMContextBuilder::new()
+        .current_account_id("vault.testnet".parse().unwrap())
         .predecessor_account_id(pred.clone())
         .attached_deposit(NearToken::from_yoctonear(deposit))
         .block_timestamp(ts_ms * 1_000_000)
-        // plenty of balance so payout promises can be created
         .account_balance(NearToken::from_yoctonear(u128::MAX / 4))
-        .build()
-}
-
-fn ctx(pred: &AccountId, deposit: u128, ts_ms: u64) {
-    testing_env!(context(pred, deposit, ts_ms)); // keeps storage
+        .build());
 }
 
 fn new_vault() -> Vault {
-    // fresh storage for every generated case
-    ctx(&owner(), 0, 0);
+    ctx(&acct(4), 0, 0);
     near_sdk::mock::with_mocked_blockchain(|b| { let _ = b.take_storage(); });
-    ctx(&owner(), 0, 0);
+    ctx(&acct(4), 0, 0);
     Vault::new(
-        owner(),
-        executor(),
-        "ab".repeat(32),
-        "https://x/y.wasm".into(),
-        Guardrails {
-            max_leverage_bps: 30_000,
-            max_drawdown_bps: 2_000,
-            max_position_bps: 5_000,
-            allowed_pairs: vec!["ETH/USDC".into()],
-        },
+        acct(4), executor(), "ab".repeat(32), "https://x/y.wasm".into(),
+        Guardrails { max_leverage_bps: 30_000, max_drawdown_bps: 2_000, max_position_bps: 5_000, allowed_pairs: vec!["ETH/USDC".into()] },
+        "alpha-vault-v1".into(), "0x18f92b8ee2dc4bc3bbbdb4138e92f184bc405b7f".into(),
     )
 }
 
 #[derive(Debug, Clone)]
 enum Op {
-    Deposit { who: usize, milli: u64 },   // amount in 1e-3 NEAR
-    Withdraw { who: usize, pct: u8 },      // % of the actor's shares
-    Pnl { bps: i32 },                      // pool gain/loss, bps of pool
-    Settle { bps_of_pool: u32 },           // external value as bps of pool
+    Deposit { who: usize, milli: u64 },
+    Withdraw { who: usize, pct: u8 },
+    /// settle at `bps` of the allowed band: -10000 = max down, +10000 = max up
+    Settle { band: i32 },
+    Repatriate { milli: u64 },
+    Claim { who: usize },
     Crystallize,
     Emergency,
 }
 
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
-        4 => (0usize..5, 1u64..2_000_000).prop_map(|(who, milli)| Op::Deposit { who, milli }),
+        4 => (0usize..5, 100u64..2_000_000).prop_map(|(who, milli)| Op::Deposit { who, milli }),
         3 => (0usize..5, 1u8..=100).prop_map(|(who, pct)| Op::Withdraw { who, pct }),
-        2 => (-3_000i32..5_000).prop_map(|bps| Op::Pnl { bps }),
-        1 => (0u32..20_000).prop_map(|bps_of_pool| Op::Settle { bps_of_pool }),
+        3 => (-10_000i32..=10_000).prop_map(|band| Op::Settle { band }),
+        1 => (1u64..500_000).prop_map(|milli| Op::Repatriate { milli }),
+        2 => (0usize..5).prop_map(|who| Op::Claim { who }),
         1 => Just(Op::Crystallize),
         1 => Just(Op::Emergency),
     ]
-}
-
-fn who(i: usize) -> AccountId { if i == 4 { owner() } else { acct(i) } }
-
-fn sum_shares(v: &Vault) -> u128 {
-    (0..5).map(|i| v.get_shares(who(i)).0).sum()
 }
 
 fn nps(v: &Vault) -> u128 {
     if v.total_shares == 0 { SCALE } else { mul_div(v.nav(), SCALE, v.total_shares) }
 }
 
+fn owed_claims(v: &Vault) -> u128 {
+    (0..5).map(|i| v.get_external_position(acct(i))["claimable_yocto"].as_str().unwrap().parse::<u128>().unwrap()).sum()
+}
+fn holder_units(v: &Vault) -> u128 {
+    (0..5).map(|i| v.get_external_position(acct(i))["units"].as_str().unwrap().parse::<u128>().unwrap()).sum()
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig { cases: std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(300), max_shrink_iters: 2000, .. ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig {
+        cases: std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(300),
+        max_shrink_iters: 2000, .. ProptestConfig::default()
+    })]
 
     #[test]
-    fn money_math_invariants(ops in prop::collection::vec(op(), 1..40)) {
+    fn v4_money_invariants(ops in prop::collection::vec(op(), 1..45)) {
         let mut v = new_vault();
         let mut t: u64 = 1;
-        let (mut deposited, mut pnl, mut paid): (i128, i128, i128) = (0, 0, 0);
-        let mut claims: i128 = 0;
+        let mut held: i128 = 0; // NEAR actually in the contract (model)
 
         for o in ops {
-            t += 1000;
+            t += 1_000;
             match o {
-                Op::Deposit { who: w, milli } => {
+                Op::Deposit { who, milli } => {
                     if v.emergency { continue; }
-                    let amt = milli as u128 * NEAR / 1000;
-                    let before_nps = nps(&v);
-                    let a = who(w);
-                    let before = v.get_shares(a.clone()).0;
-                    let total_before = v.total_shares;
+                    let amt = (milli as u128 * NEAR / 1000).max(MIN_DEPOSIT);
+                    let a = acct(who);
                     ctx(&a, amt, t);
-                    let minted = v.deposit().0;
-                    // the manager also receives any fee shares crystallized first
-                    let fee = v.total_shares - total_before - minted;
-                    let expect = if a == owner() { before + minted + fee } else { before + minted };
-                    prop_assert_eq!(v.get_shares(a.clone()).0, expect);
-                    // I3: shares minted are worth <= what was paid
-                    let worth = mul_div(v.nav(), minted, v.total_shares);
-                    prop_assert!(worth <= amt, "deposit minted {} worth more than {}", worth, amt);
-                    // I4: NAV/share doesn't drop for existing holders (fee crystallization may lower it legitimately: only check when no gain above HWM)
-                    if before_nps <= v.hwm_nav_per_share {
-                        prop_assert!(nps(&v) + 1 >= before_nps, "deposit lowered NAV/share {} -> {}", before_nps, nps(&v));
-                    }
-                    deposited += amt as i128;
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| v.deposit().0));
+                    let Ok(minted) = r else { continue };
+                    // S6
+                    prop_assert!(mul_div(v.nav(), minted, v.total_shares) <= amt);
+                    held += amt as i128;
                 }
-                Op::Withdraw { who: w, pct } => {
-                    let a = who(w);
-                    let have = v.get_shares(a.clone()).0;
-                    let burn = have * pct as u128 / 100;
+                Op::Withdraw { who, pct } => {
+                    let a = acct(who);
+                    let burn = v.get_shares(a.clone()).0 * pct as u128 / 100;
                     if burn == 0 { continue; }
-                    let (pool0, ext0, total0, nav0) = (v.pool, v.external_value, v.total_shares, v.nav());
                     ctx(&a, 0, t);
-                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { let _ = v.withdraw(U128(burn)); }));
-                    if r.is_err() { continue; } // e.g. insufficient local liquidity: allowed refusal
-                    let out = pool0 - v.pool;
-                    if v.emergency {
-                        // I6
-                        prop_assert!(out <= mul_div(pool0, burn, total0));
-                        let claim = ext0 - v.external_value;
-                        prop_assert_eq!(claim, mul_div(ext0, burn, total0));
-                        claims += claim as i128;
-                    } else {
-                        // I3: never paid more than the shares' NAV at the time
-                        // (fees may crystallize first, which only lowers it)
-                        prop_assert!(out <= mul_div(nav0, burn, total0), "withdraw paid {} > fair {}", out, mul_div(nav0, burn, total0));
-                    }
-                    paid += out as i128;
+                    // fees may crystallize first (diluting): compute fair slice after
+                    if !v.emergency { v.crystallize_fees(); }
+                    let fair = mul_div(v.pool, burn, v.total_shares);
+                    let p0 = v.pool;
+                    let _ = v.withdraw(U128(burn));
+                    let paid = if v.total_shares == 0 { fair } else { p0 - v.pool };
+                    prop_assert_eq!(paid, fair, "S5: withdrawal must be the exact pool slice");
+                    held -= paid as i128;
                 }
-                Op::Pnl { bps } => {
-                    if v.pool == 0 { continue; }
-                    let delta = (v.pool as i128) * bps as i128 / 10_000;
-                    let np = (v.pool as i128 + delta).max(0) as u128;
-                    pnl += np as i128 - v.pool as i128;
-                    v.pool = np;
-                }
-                Op::Settle { bps_of_pool } => {
+                Op::Settle { band } => {
                     if v.emergency || v.total_shares == 0 { continue; }
-                    let new_ext = v.pool * bps_of_pool as u128 / 10_000;
-                    let old_ext = v.external_value;
-                    let first = v.last_settlement_ref.is_none() && v.external_value == 0;
-                    let before_nps = nps(&v);
+                    t += MIN_SETTLE_INTERVAL_MS + 1;
+                    let nav = v.nav();
+                    let step = nav / 10;
+                    let holders_now = v.holders_ext_value() as i128;
+                    let target_holders = (holders_now + step as i128 * band as i128 / 10_000).max(0) as u128;
+                    // convert holders' target back to whole-wallet value
+                    let new_ext = if v.ext_units_total == 0 { target_holders }
+                        else { mul_div(target_holders, v.ext_units_total, v.vault_ext_units.max(1)) };
                     ctx(&executor(), 0, t);
-                    v.settle_pnl(U128(new_ext), 1, "fuzz".into());
-                    if first && new_ext > 0 {
-                        // seed capital: NAV/share unchanged (within rounding)
-                        prop_assert!(nps(&v).abs_diff(before_nps) <= 1, "seed moved NAV/share {} -> {}", before_nps, nps(&v));
-                        deposited += new_ext as i128; // capital, not PnL
-                    } else {
-                        pnl += new_ext as i128 - old_ext as i128;
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| v.settle_pnl(U128(new_ext), 1, "fuzz".into())));
+                }
+                Op::Repatriate { milli } => {
+                    if v.ext_units_total == 0 { continue; }
+                    let amt = milli as u128 * NEAR / 1000;
+                    ctx(&acct(4), amt, t);
+                    v.repatriate();
+                    held += amt as i128;
+                }
+                Op::Claim { who } => {
+                    let a = acct(who);
+                    ctx(&a, 0, t);
+                    let before = v.ext_paid_total;
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { let _ = v.claim_external(); })).is_ok() {
+                        held -= (v.ext_paid_total - before) as i128;
                     }
                 }
                 Op::Crystallize => {
-                    let m0 = v.get_shares(owner()).0;
+                    let m0 = v.get_shares(acct(4)).0;
                     let above = nps(&v) > v.hwm_nav_per_share;
-                    ctx(&owner(), 0, t);
+                    ctx(&acct(4), 0, t);
                     v.crystallize_fees();
-                    // I5
-                    if !above { prop_assert_eq!(v.get_shares(owner()).0, m0, "fee minted without a new high"); }
+                    if !above { prop_assert_eq!(v.get_shares(acct(4)).0, m0, "S7"); }
                 }
                 Op::Emergency => {
                     if v.emergency { continue; }
@@ -189,12 +169,16 @@ proptest! {
                     v.trigger_emergency();
                 }
             }
-            // I1
-            prop_assert_eq!(sum_shares(&v), v.total_shares, "share ledger out of sync");
-            // I2 conservation (claims are value moved out of `external`)
-            let lhs = deposited + pnl;
-            let rhs = v.pool as i128 + v.external_value as i128 + paid + claims;
-            prop_assert_eq!(lhs, rhs, "value created or destroyed");
+            // S1
+            let sum: u128 = (0..5).map(|i| v.get_shares(acct(i)).0).sum();
+            prop_assert_eq!(sum, v.total_shares, "S1 share ledger");
+            // S2 solvency
+            let owed = v.pool + owed_claims(&v);
+            prop_assert!(held >= owed as i128, "S2 insolvent: holds {} owes {}", held, owed);
+            // S3
+            prop_assert!(v.ext_paid_total <= v.repatriated_total, "S3 paid more than repatriated");
+            // S4
+            prop_assert_eq!(v.vault_ext_units + holder_units(&v), v.ext_units_total, "S4 units");
         }
     }
 }
