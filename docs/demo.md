@@ -20,15 +20,26 @@ beat under 20 seconds.
 
 Pre-record safety: capture shots 2–6 as backup GIFs in case of live hiccups.
 
-## X post (tag @NEARProtocol, #NEARHackathon, attach video)
+## X post (follows the organizers' four tips: user problem first, one complete moment, NEAR's role concretely, a next step)
 
-> Trading vaults that prove they're honest — without revealing the strategy.
+> AI fund managers ask you to trust them. This one can't lie.
 >
-> Params sealed in a TDX enclave (OutLayer). Every trade hash-committed on @NEARProtocol before execution. Leverage/drawdown limits proven with Bulletproofs — verified in your browser. Cross-chain via Chain Signatures.
+> Built Verifiable Alpha Vaults at NEAR HACKATHON: the strategy's parameters stay sealed in Intel TDX, yet anyone can check which code ran, that every trade was committed before it executed, and that risk limits held. Bulletproofs, verified in your browser.
 >
-> Try to cheat it 👇 #NEARHackathon
+> What NEAR does here: OutLayer runs the sealed strategy, Chain Signatures lets the vault contract sign its own swaps, NEAR Intents brings the money back as NEAR.
 >
-> [video] · github.com/amudhan23/verifiable-alpha-vaults
+> Try to cheat it yourself, then check every claim from your terminal: [repo] · [site]
+> Would you put money in a vault you can verify but can't see inside?
+>
+> @NEARProtocol #NEARHackathon @NearLegion @NearBuilders
+
+Video (60 to 90 seconds, one complete moment, no slides):
+
+1. **(0–8s)** On screen: "AI fund managers say trust me. This one can't lie."
+2. **(8–30s)** Open the vault page and press **Run all checks**. Each seal turns green; one sentence per seal.
+3. **(30–50s)** Counterfeit Bureau: demand 10x leverage, which is refused; back-fill a trade, which is caught.
+4. **(50–75s)** Sepolia Etherscan: the vault's own swap, with the calldata ending in the decision's hash. Say "sized inside the enclave, signed by the contract, through NEAR Chain Signatures".
+5. **(75–90s)** Terminal: `node executor/verify.mjs`, ending in 6/6 passed. Close with the repo link.
 
 ## Submission description (20–2000 chars; this is ~1,300)
 

@@ -215,6 +215,16 @@ set up your own: `scripts/outlayer-setup.md`, then `node executor/deploy.mjs`.
 - Built for the NEAR hackathon (Nov 2026). **Not** audited; testnet only.
   Shade Agents were not used (deprecated Apr 2026); the TEE path is OutLayer.
 
+## Where this goes
+
+- **Who pays.** Strategy creators earn a 20% performance fee on realized gains above a high-water mark, paid to whoever holds the strategy NFT. A protocol share of that fee is the natural business model. Investors pay nothing to deposit or withdraw.
+- **Why it can grow.** Every vault builds a track record nobody can fake. Strategy NFTs carry that record and the future fees, so good strategies become tradable assets, and new strategies can enter without a brand, just with proofs.
+- **Next steps:**
+  1. A manager-only mainnet vault on Base; the build is ready.
+  2. An enclave that fetches its own prices.
+  3. A factory contract and web form, so designers launch vaults without the command line.
+  4. A professional audit before outside deposits.
+
 ## Built with, and disclosure
 
 - **Everything here was written during the hackathon window.** The first commit is 11 Nov 2026; there is no pre-hackathon code.
