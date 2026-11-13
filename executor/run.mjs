@@ -180,7 +180,7 @@ async function onchainCycle({ input, epoch, market }) {
   console.log(`→ vault.request_decision (epoch ${epoch}): OutLayer runs the approved build in TDX and calls the vault back`);
   const t0 = Date.now();
   const res = await vault.callRaw("request_decision", { input_json: JSON.stringify(input) },
-    300_000_000_000_000n, (100_000_000_000_000_000_000_000n + 7_500_000_000_000_000_000_000n).toString()); // 0.1 storage reserve + OutLayer fee
+    240_000_000_000_000n, (100_000_000_000_000_000_000_000n + 7_500_000_000_000_000_000_000n).toString()); // 0.1 storage reserve + OutLayer fee
   const logs = res.receipts_outcome.flatMap((o) => o.outcome.logs);
   const ev = (name) => logs.filter((l) => l.includes(`"event":"${name}"`)).map((l) => JSON.parse(l.slice(11)).data[0]);
   const failed = ev("decision_request_failed")[0];

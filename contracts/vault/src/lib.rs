@@ -103,8 +103,8 @@ const USDC: [u8; 20] = hex20("1c7d4b196cb0c7b01d743fbc6116a902379c7238");
 const ROUTER: [u8; 20] = hex20("3bfa4769fb09eefc5a80d6e87c3b9c650f7ae48e");
 const MAX_FEE_PER_GAS: u128 = 100_000_000_000; // 100 gwei
 /// Per-leg gas caps (gas is paid from the vault's own ETH).
-const GAS_CAP_WRAP: u64 = 200_000;
-const GAS_CAP_APPROVE: u64 = 120_000;
+const GAS_CAP_WRAP: u64 = 250_000;
+const GAS_CAP_APPROVE: u64 = 250_000; // Sepolia WETH: wrap alone burns ~133k
 const GAS_CAP_SWAP: u64 = 400_000;
 const MAX_GAS_LIMIT: u64 = GAS_CAP_SWAP;
 

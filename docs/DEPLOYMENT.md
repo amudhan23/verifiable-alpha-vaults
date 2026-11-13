@@ -117,3 +117,19 @@ Investigated against OutLayer's TEE docs and the testnet register contract:
 - **First v5 cycle** (relayed): commitment #17, guardrail-checked reveal, Bulletproof bundle anchored, with the relayer paying its own storage. Settlement was correctly skipped (1h spacing).
 - **Deposits are closed** on this vault while its cross-chain wallet holds value (~43.8 NEAR at the last settlement). They reopen when that value is repatriated as NEAR.
 - **Attested path, live (12 Nov):** `request_decision` now passes an explicit 5e9-instruction budget. The vault called OutLayer's `request_execution` itself (tx `CpUKMrgDPGwCWXEmmQFhyfv4sLb22c6WY6bttZDm5527`, ~20s round trip). Its callback created commitment #18, anchored the Bulletproof bundle straight from the enclave's delivery, and correctly skipped a settlement that moved NAV by more than 10%. The relayer then revealed the decision whose hash the enclave had already fixed on-chain. Saturday plan: apply strategy v2, run this path once more with a trade, then `enable_attested`.
+
+## Rehearsal vault (13 Nov): full attested trade, end to end
+
+`vault2.alpha-vaults-23.testnet` was deployed with strategy v2 approved from the start (no timelock to wait out). Its EVM wallet is `0x594441E82Ae00F744992bC465e92a9AF441A8696`. One complete cycle, with no relayer between the enclave and the vault:
+
+1. **Request.** `request_decision` (tx `6CD9wME5tHnHRRhwZkvZQ3j62kTgTV7TvHXjEEJzTQro`): the vault asked OutLayer on-chain, and a TDX worker answered into the vault's callback. The callback committed #2 and anchored the Bulletproofs.
+2. **Reveal.** The relayer revealed the decision. Its hash was already fixed on-chain, so it could not be changed.
+3. **Swap.** The vault built and MPC-signed the approve (`0x7d6bb2f8…`) and the swap (`0xa7ca6d0e…`): **sell 0.01308 ETH, size and 38.46 USDC floor chosen by the enclave**, recipient the vault's own address, `multicall` with a deadline. The swap's calldata ends in commitment `55b77309…`.
+
+Prices came from the fixed demo series (`FIXED_TREND=down`), and the price check labels them as demo data.
+
+Found during the rehearsal, and fixed on both vaults before Saturday:
+
+- **Gas cap.** The v5 per-leg cap of 120k gas was too low for Sepolia WETH's `approve` (the wrap alone uses 133k). Wrap and approve are now capped at 250k.
+- **Pool direction.** Sepolia's ETH/USDC pool prices ETH about 10× *above* the oracle, not below. Buys can never meet the enclave's 2% floor; sells fill well above it (0.01308 ETH returned about 422 USDC).
+- **Secrets whitelist cache.** OutLayer serves a newly whitelisted caller only after a few minutes. Requests made before that time out without an answer.

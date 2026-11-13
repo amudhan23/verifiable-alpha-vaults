@@ -74,9 +74,12 @@ export async function fetchMarket() {
 }
 
 /** Offline/test mode: deterministic. */
-export function fixedMarket() {
+/** Deterministic demo series: rising (default, a buy signal) or falling (FIXED_TREND=down, a sell). */
+export function fixedMarket(trend = process.env.FIXED_TREND ?? "up") {
+  const up = [3000, 3002, 2998, 3004, 3010, 3025, 3042, 3060, 3081, 3105];
+  const prices = trend === "down" ? [...up].reverse() : up;
   return {
-    prices: [3000, 3002, 2998, 3004, 3010, 3025, 3042, 3060, 3081, 3105],
-    oracle: { spot_source: "fixed-demo", series_source: "fixed-demo", eth_usd: 3105, near_usd: 5, as_of: 0 },
+    prices,
+    oracle: { spot_source: "fixed-demo", series_source: "fixed-demo", eth_usd: prices[prices.length - 1], near_usd: 5, as_of: 0 },
   };
 }

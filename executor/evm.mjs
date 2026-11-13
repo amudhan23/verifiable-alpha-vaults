@@ -230,7 +230,7 @@ export class ChainSigExecutor {
 // vault signed, attaches the signature, and broadcasts.
 // ---------------------------------------------------------------------------
 // per-leg caps, mirrored from the v5 contract
-const GAS = { wrap: 200_000n, approve: 120_000n, swap: 400_000n };
+const GAS = { wrap: 250_000n, approve: 250_000n, swap: 400_000n };
 const MAX_FEE_CAP = 100_000_000_000n;
 
 /** The exact swap calldata the v5 contract builds: multicall(deadline, [exactInputSingle ‖ commitment]). */
@@ -300,7 +300,7 @@ export class VaultSignedExecutor {
       max_priority_fee_per_gas: maxPriorityFeePerGas.toString(),
       gas_limit: Number(gas),
       deadline_s: Number(deadline),
-    }, 300_000_000_000_000n, "5000000000000000000000"); // 0.005 NEAR: leg storage + MPC fee
+    }, 240_000_000_000_000n, "5000000000000000000000"); // 0.005 NEAR: leg storage + MPC fee
     const logs = res.receipts_outcome.flatMap((r) => r.outcome.logs);
     const req = logs.map((l) => l.match(/"event":"evm_sign_requested".*"payload":"([0-9a-f]{64})"/)).find(Boolean);
     if (!req) throw new Error("vault did not log a sign request");
