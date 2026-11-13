@@ -43,7 +43,7 @@ export async function checkTradesCommitted(vault, onStep = () => {}) {
     okCount++;
     await new Promise((r) => setTimeout(r, 60)); // let the viewer see it run
   }
-  return { state: "ok", detail: `${okCount}/${revealed.length} commitments recomputed in this browser` };
+  return { state: "ok", detail: `${okCount}/${revealed.length} commitments recomputed here` };
 }
 
 /** Badge 1 (quick, sync): on-chain state only, for leaderboard chips.
@@ -69,8 +69,11 @@ export async function checkCodeAttestedDeep(vault, onStep = () => {}) {
   const quick = checkCodeAttested(vault);
   if (quick.state !== "ok") return quick;
   const fetchable = vault.commitments.filter((c) => c.attestation_ref?.startsWith("https://")).slice(-6);
+  const onchainOnly = vault.commitments.filter((c) => c.attestation_ref?.startsWith("onchain")).length;
   if (fetchable.length === 0)
-    return { ...quick, detail: quick.detail + " (no fetchable attestations — demo data)" };
+    return onchainOnly
+      ? { state: "ok", detail: `${onchainOnly} decisions delivered on-chain by OutLayer's TDX workers straight to the vault, pinned to the approved build ${String(vault.approved_wasm_hash ?? "").slice(0, 12)}…` }
+      : { ...quick, detail: quick.detail + " (no fetchable attestations — demo data)" };
   let verified = 0;
   for (const c of fetchable) {
     onStep(c.id);
@@ -146,7 +149,7 @@ export async function checkRiskProven(vault, onStep = () => {}) {
   const onPositions = vault.commitments.filter((c) => c.input_json?.includes('"vault_state"')).length;
   return {
     state: "ok",
-    detail: `${vault.risk_proofs.length} Bulletproof bundles verified in this browser (leverage ≤ ${vault.guardrails.max_leverage_bps / 10000}x, drawdown ≤ ${vault.guardrails.max_drawdown_bps / 100}%)${onPositions ? `; latest ${onPositions} computed from actual holdings, inputs checked by the contract` : ""}`,
+    detail: `${vault.risk_proofs.length} Bulletproof bundles verified here (leverage ≤ ${vault.guardrails.max_leverage_bps / 10000}x, drawdown ≤ ${vault.guardrails.max_drawdown_bps / 100}%)${onPositions ? `; latest ${onPositions} computed from actual holdings, inputs checked by the contract` : ""}`,
   };
 }
 

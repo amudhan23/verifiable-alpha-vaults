@@ -3,6 +3,8 @@
 **AI trading vaults where the strategy's parameters stay sealed in secure
 hardware — and everything an investor needs to check is provable.**
 
+> **Don't trust us: check.** [`VERIFY.md`](VERIFY.md) lists every claim with the code that enforces it, the test that attacks it and a live transaction. `node executor/verify.mjs` runs six checks against the live vault from your terminal: read-only, no keys.
+
 Traders can't raise money without showing their strategy; once shown, it gets
 copied and front-run. Investors can't trust a black box. Alpha Vaults seals the
 strategy's *parameters* inside an Intel TDX enclave (OutLayer) and makes four
@@ -98,7 +100,7 @@ investor ──deposit──► Vault contract (NEAR, near-sdk Rust)
 ## Run everything (no network needed)
 
 ```bash
-cargo test --workspace          # 52 Rust tests incl. a property-based fuzz of the money invariants
+cargo test --workspace          # 54 Rust tests incl. a property-based fuzz of the money invariants
 (cd executor && npm ci)         # once
 node executor/test.mjs          # 4 executor tests incl. a full local-enclave cycle
 node executor/run.mjs           # one full cycle, offline: enclave -> commit -> reveal -> proof
