@@ -62,6 +62,23 @@ export function checkCodeAttested(vault) {
   return { state: "ok", detail: `${vault.commitments.length} decisions attested${rot}; current build ${vault.approved_wasm_hash.slice(0, 12)}…` };
 }
 
+/** Fetch an OutLayer attestation, retrying once. Returns null when the API is
+ * unreachable or answers with an error (rate limit, 5xx): that is "can't check
+ * right now", never evidence of tampering. */
+async function fetchAttestation(url) {
+  for (let i = 0; i < 2; i++) {
+    try {
+      const r = await fetch(url);
+      if (r.ok) {
+        const att = await r.json();
+        if (att && (att.executed_wasm_sha256 || att.wasm_hash) && att.input_hash) return att;
+      }
+    } catch { /* retry */ }
+    await new Promise((res) => setTimeout(res, 1200));
+  }
+  return null;
+}
+
 /** Badge 1 (deep): fetch each TDX attestation from OutLayer's public API and
  * check the code that ACTUALLY executed equals the hash the contract recorded
  * (and enforced) for that decision. Real third-party verification. */
@@ -78,7 +95,8 @@ export async function checkCodeAttestedDeep(vault, onStep = () => {}) {
   for (const c of fetchable) {
     onStep(c.id);
     try {
-      const att = await (await fetch(c.attestation_ref)).json();
+      const att = await fetchAttestation(c.attestation_ref);
+      if (!att) return { state: "wait", detail: `attestation for #${c.id} not reachable right now` };
       const executed = att.executed_wasm_sha256 ?? att.wasm_hash;
       if (executed !== c.wasm_hash)
         return { state: "bad", detail: `#${c.id}: TDX says ${String(executed).slice(0, 12)}… ran, vault recorded ${c.wasm_hash.slice(0, 12)}…` };
@@ -163,8 +181,8 @@ export async function checkPricesVerified(vault, onStep = () => {}) {
   let hashed = 0, crossChecked = 0;
   for (const c of withInput) {
     onStep(c.id);
-    const att = await (await fetch(c.attestation_ref)).json().catch(() => null);
-    if (!att) return { state: "wait", detail: `attestation for #${c.id} not reachable` };
+    const att = await fetchAttestation(c.attestation_ref);
+    if (!att) return { state: "wait", detail: `attestation for #${c.id} not reachable right now` };
     const h = await sha256Hex(new TextEncoder().encode(c.input_json));
     if (h !== att.input_hash)
       return { state: "bad", detail: `#${c.id}: published input does not hash to the attested input_hash` };
@@ -173,7 +191,7 @@ export async function checkPricesVerified(vault, onStep = () => {}) {
     if (o?.as_of && o.eth_usd) {
       try {
         const r = await fetch(`https://api.coingecko.com/api/v3/coins/ethereum/market_chart/range?vs_currency=usd&from=${o.as_of - 900}&to=${o.as_of + 900}`);
-        const pts = (await r.json()).prices ?? [];
+        const pts = r.ok ? ((await r.json()).prices ?? []) : [];
         if (pts.length) {
           const near = pts.reduce((a, b) => (Math.abs(b[0] / 1000 - o.as_of) < Math.abs(a[0] / 1000 - o.as_of) ? b : a));
           if (Math.abs(near[1] / o.eth_usd - 1) > 0.02)
