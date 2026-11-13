@@ -1,21 +1,56 @@
 # Verifiable Alpha Vaults
 
-**AI trading vaults where the strategy's parameters stay sealed in secure
-hardware — and everything an investor needs to check is provable.**
+AI trading vaults on NEAR where the strategy's parameters stay sealed in Intel TDX hardware, while every claim an investor needs (which code ran, that no trade was back-filled, that risk limits held, that returns are real) can be checked by anyone, in a browser, without trusting us.
 
-> **Don't trust us: check.** [`VERIFY.md`](VERIFY.md) lists every claim with the code that enforces it, the test that attacks it and a live transaction. `node executor/verify.mjs` runs six checks against the live vault from your terminal: read-only, no keys.
+Built at NEAR HACKATHON (Nov 2026), solo. Live on NEAR testnet. A 16-page product document with diagrams is in [`docs/Product-Document.pdf`](docs/Product-Document.pdf).
 
-Traders can't raise money without showing their strategy; once shown, it gets
-copied and front-run. Investors can't trust a black box. Alpha Vaults seals the
-strategy's *parameters* inside an Intel TDX enclave (OutLayer) and makes four
-things independently verifiable:
+## The problem
 
-| # | Claim | How it's verified |
-|---|-------|-------------------|
-| 1 | **Which code ran** | TDX hardware attestation of the strategy WASM hash (OutLayer); the vault contract refuses decisions attested to any other hash and pauses deposits |
-| 2 | **No back-filling** | Every decision's hash is committed on NEAR *before* execution; a reveal that doesn't match a prior commitment aborts |
-| 3 | **Risk limits held** | Guardrails (leverage ≤ 3x, position caps, asset allowlist) enforced in the contract before anything is signed, **plus** Bulletproofs range proofs that private risk metrics stayed in range — verified in your browser |
-| 4 | **Real returns** | Share accounting and NAV history are on-chain; returns computed from balances + oracle |
+- **Investors can't verify AI fund managers.** They can't see which code runs, whether the track record was back-filled, or whether "max 3x leverage" was ever enforced.
+- **Managers can't prove themselves without leaking the edge.** Publishing a strategy gets it copied; hiding it means nobody can trust it.
+
+## The solution in one paragraph
+
+The strategy's **code is public** (anyone can read it and check its hash), its **parameters are sealed** in an Intel TDX enclave on OutLayer, and its **behaviour is provable**:
+
+- Every decision is hashed on NEAR before it executes.
+- The vault contract refuses anything outside its risk limits.
+- Bulletproofs show private risk metrics stayed in range.
+- The vault signs its own Uniswap trades through NEAR Chain Signatures, at the size the enclave chose.
+- Value comes back as NEAR through NEAR Intents.
+
+## Try it: do X, see Y
+
+| Do | See |
+|---|---|
+| `./scripts/judge-check.sh` | 56 Rust tests (incl. a property-based fuzz of the money rules) and 4 executor tests pass; one full decision cycle runs offline; then six read-only checks run against the live testnet vault. Ends with a PASS/FAIL summary. |
+| Open the site ([hosted](https://amudhan23.github.io/verifiable-alpha-vaults/) or `cd frontend && python3 -m http.server 8080`), open `vault.alpha-vaults-23.testnet`, press **Run all checks** | Four seals turn green, computed in your browser: TDX attestations match the approved code, every decision recomputes to its earlier on-chain hash, Bulletproofs verify, enclave inputs match their attested hashes. |
+| On the site, open the **Counterfeit Bureau** and try a cheat: back-fill a trade, demand 10x leverage, swap the code | Each attempt is refused, and the page shows which rule caught it. |
+| `cd executor && npm ci && node verify.mjs --vault vault2.alpha-vaults-23.testnet` | 5/5 checks pass, including a swap on Sepolia whose calldata ends in the hash of the decision committed before it. |
+| Open [the attested swap on Sepolia](https://sepolia.etherscan.io/tx/0xa7ca6d0ebe7144bb829194832ea047c9c7a6594dbada642bbbd5a97fc19f13a1) | A sell of 0.01308 ETH sent from the vault's own address; the size and the 38.46 USDC floor were chosen inside the enclave; the input data ends in commitment `55b77309…`. |
+| `node executor/run.mjs` | One full cycle against a local enclave: decide, commit, reveal, guardrail check, Bulletproofs. No network or keys needed. |
+
+Every claim with its code, its test and a live transaction: [`VERIFY.md`](VERIFY.md).
+
+## What's live, and what isn't
+
+| Piece | Status |
+|---|---|
+| Vault contract (v5) with shares, guardrails, commit-then-reveal, timelocks, emergency exit | **Live** on testnet (`vault.alpha-vaults-23.testnet`, `vault2.alpha-vaults-23.testnet`) |
+| Strategy in Intel TDX (OutLayer) with sealed parameters | **Live** (relayed over HTTPS on the main vault) |
+| Attested mode: the vault requests the run on-chain and receives it in its own callback | **Live** on the rehearsal vault (full cycle with a swap); switched on for the main vault 14 Nov |
+| Vault-signed Uniswap swaps via Chain Signatures | **Live** on Ethereum Sepolia |
+| NEAR Intents way back (USDC to NEAR) | Arrival half **live** on testnet; send half built and tested but mainnet-only, because NEAR Intents has no testnet; live 1Click quotes |
+| Mainnet (trading on Base) | Built and tested, **not deployed** |
+| Professional audit | **No**. Two independent AI-assisted reviews, see [`docs/SECURITY.md`](docs/SECURITY.md) |
+
+## How NEAR is used
+
+- **Vault contract on NEAR** (near-sdk, Rust): holds the money and enforces every rule.
+- **OutLayer** (NEAR's TEE network, Intel TDX): runs the sealed strategy. Its on-chain `request_execution` can only be resolved by DCAP-verified TDX workers, so a decision delivered to the vault's callback is attested by construction.
+- **Chain Signatures** (NEAR MPC): the vault contract controls its own Ethereum address and signs its own swaps; no relayer wallet ever holds the funds.
+- **NEAR Intents** (1Click): brings cross-chain value back to the vault as NEAR.
+- **NEP-171**: the strategy is an NFT. Its holder earns the performance fee and proposes changes; a pending proposal lapses if the NFT is sold.
 
 ### Security, reviewed adversarially
 
@@ -179,3 +214,16 @@ set up your own: `scripts/outlayer-setup.md`, then `node executor/deploy.mjs`.
   every reveal before an execution signature exists.
 - Built for the NEAR hackathon (Nov 2026). **Not** audited; testnet only.
   Shade Agents were not used (deprecated Apr 2026); the TEE path is OutLayer.
+
+## Built with, and disclosure
+
+- **Everything here was written during the hackathon window.** The first commit is 11 Nov 2026; there is no pre-hackathon code.
+- **AI-assisted.** Most of the code and docs were written with an AI coding assistant (Claude, by Anthropic) directed by the author, which is allowed by the rules. Both security reviews were also AI-assisted and are documented in [`docs/SECURITY.md`](docs/SECURITY.md).
+- **Main libraries.** These are the direct dependencies; `Cargo.toml` and `package.json` have the full lists.
+  - Rust: `near-sdk`, `near-contract-standards`, `bulletproofs`, `curve25519-dalek-ng`, `merlin`, `sha2`, `chacha20poly1305`, `uint`, `proptest`.
+  - JavaScript: `near-api-js`, `chainsig.js`, `viem`, `@noble/ciphers`, `@near-wallet-selector`.
+- **External services:** OutLayer (TDX enclaves), NEAR MPC (Chain Signatures), NEAR Intents 1Click API, Uniswap v3, Pyth and CoinGecko price feeds.
+
+## License
+
+MIT, see [`LICENSE`](LICENSE).
