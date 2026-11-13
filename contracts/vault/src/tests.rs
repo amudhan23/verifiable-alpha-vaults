@@ -506,6 +506,39 @@ fn unwrapped_near_from_intents_is_credited_like_repatriation() {
 }
 
 #[test]
+fn close_is_public_48h_stops_deposits_and_needs_an_empty_vault() {
+    let mut v = new_vault();
+    at(alice(), NEAR, 1_000);
+    v.deposit();
+    ctx(mallory(), 0);
+    assert!(panics(|| v.propose_close()), "manager only");
+    at(owner(), 0, 2_000);
+    v.propose_close();
+    at(mallory(), NEAR, 3_000);
+    assert!(panics(|| { v.deposit(); }), "no new money into a closing vault");
+    at(mallory(), 0, 2_000 + ROTATION_DELAY_MS - 1);
+    assert!(panics(|| { let _ = v.close_vault(); }), "48h public first");
+    at(mallory(), 0, 2_000 + ROTATION_DELAY_MS);
+    assert!(panics(|| { let _ = v.close_vault(); }), "alice still has money in it");
+    let sh = v.get_shares(alice());
+    at(alice(), 0, 2_000 + ROTATION_DELAY_MS + 1);
+    let _ = v.withdraw(sh);
+    at(mallory(), 0, 2_000 + ROTATION_DELAY_MS + 2);
+    let _ = v.close_vault();
+    assert!(get_logs().iter().any(|l| l.contains("vault_closed")));
+}
+
+#[test]
+fn network_is_chosen_by_the_vault_account_not_by_anyone() {
+    testing_env!(VMContextBuilder::new().current_account_id("vault.alpha-vaults.near".parse().unwrap()).build());
+    assert_eq!(net().evm_chain_id, 8_453);
+    assert_eq!(net().mpc_signer, "v1.signer");
+    assert_eq!(net().outlayer, "outlayer.near");
+    testing_env!(VMContextBuilder::new().current_account_id(vault_id()).build());
+    assert_eq!(net().evm_chain_id, 11_155_111);
+}
+
+#[test]
 fn code_upgrade_is_timelocked_and_hash_bound() {
     let mut v = new_vault();
     at(owner(), 0, 0);
@@ -568,7 +601,7 @@ fn sign_evm_tx_signs_only_the_committed_trade() {
 fn swap_calldata_is_a_deadlined_multicall_paying_the_vault() {
     let me = parse_evm_address(EVM);
     let c = "ab".repeat(32);
-    let data = evm::swap_calldata(&WETH, &USDC, 3000, &me, 5, 4, 1234, &c);
+    let data = evm::swap_calldata(&SEPOLIA.weth, &SEPOLIA.usdc, 3000, &me, 5, 4, 1234, &c);
     assert_eq!(&data[..4], &hex::decode("5ae401dc").unwrap()[..]);
     assert_eq!(&data[4 + 16..36], &1234u128.to_be_bytes()[..], "deadline word");
     let inner = &data[4 + 32 * 5..];

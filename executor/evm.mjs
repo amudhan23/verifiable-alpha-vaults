@@ -11,6 +11,7 @@
 // A Uniswap v3 swap drops into `buildCalldata` without changing the flow.
 // NEAR-native DEX swap remains the fallback if the EVM leg misbehaves live.
 
+import { netFor } from "./net.mjs";
 export const MPC_TESTNET_CONTRACT = "v1.signer-prod.testnet";
 
 // Uniswap v3 on Ethereum Sepolia — each address verified on-chain (code
@@ -36,10 +37,11 @@ export class ChainSigExecutor {
    *          networkId?:string, rpcUrl?:string}} cfg
    */
   constructor(cfg) {
+    const n = netFor(cfg.accountId);
     this.cfg = {
-      networkId: "testnet",
+      networkId: n.near,
       derivationPath: "alpha-vault-v1",
-      rpcUrl: "https://ethereum-sepolia-rpc.publicnode.com",
+      rpcUrl: n.evm.rpc,
       ...cfg,
     };
     this._ready = null;
@@ -60,8 +62,8 @@ export class ChainSigExecutor {
         contracts.near?.ChainSignatureContract ?? contracts.ChainSignatureContract;
       this.contract = new ChainSignatureContract({
         networkId: this.cfg.networkId,
-        contractId: MPC_TESTNET_CONTRACT,
-        fallbackRpcUrls: ["https://rpc.testnet.near.org"],
+        contractId: netFor(this.cfg.accountId).mpc,
+        fallbackRpcUrls: [netFor(this.cfg.accountId).nearRpc],
       });
       this.toRSV = (sig) =>
         "big_r" in sig
@@ -71,9 +73,10 @@ export class ChainSigExecutor {
       const { connect, keyStores } = await import("near-api-js");
       const keyStore = new keyStores.InMemoryKeyStore();
       await keyStore.setKey(this.cfg.networkId, this.cfg.accountId, KeyPair.fromString(this.cfg.privateKey));
-      const near = await connect({ networkId: this.cfg.networkId, nodeUrl: "https://rpc.testnet.near.org", keyStore });
+      const near = await connect({ networkId: this.cfg.networkId, nodeUrl: netFor(this.cfg.accountId).nearRpc, keyStore });
       this.nearAccount = await near.account(this.cfg.accountId);
-      const publicClient = createPublicClient({ chain: sepolia, transport: http(this.cfg.rpcUrl) });
+      const chains = await import("viem/chains");
+      const publicClient = createPublicClient({ chain: chains[netFor(this.cfg.accountId).evm.viemChain], transport: http(this.cfg.rpcUrl) });
       this.pub = publicClient;
       this.viem = await import("viem");
       this.evm = new chainAdapters.evm.EVM({ publicClient, contract: this.contract });
@@ -246,18 +249,20 @@ export function swapCalldata(viem, { tokenIn, tokenOut, fee, recipient, amountIn
 
 export class VaultSignedExecutor {
   /** @param {{vault: import('./vault.mjs').NearVault, vaultId: string, mpcPath?: string}} cfg */
-  constructor({ vault, vaultId, mpcPath = "alpha-vault-v1", rpcUrl = "https://ethereum-sepolia-rpc.publicnode.com" }) {
+  constructor({ vault, vaultId, mpcPath = "alpha-vault-v1", rpcUrl }) {
     this.vault = vault;
     this.vaultId = vaultId;
     this.mpcPath = mpcPath;
-    this.rpcUrl = rpcUrl;
+    this.net = netFor(vaultId);
+    this.uni = this.net.uni;
+    this.rpcUrl = rpcUrl ?? this.net.evm.rpc;
   }
 
   async init() {
     if (this.pub) return;
     this.viem = await import("viem");
-    const { sepolia } = await import("viem/chains");
-    this.pub = this.viem.createPublicClient({ chain: sepolia, transport: this.viem.http(this.rpcUrl) });
+    const chains = await import("viem/chains");
+    this.pub = this.viem.createPublicClient({ chain: chains[this.net.evm.viemChain], transport: this.viem.http(this.rpcUrl) });
     const s = await this.vault.view("get_summary");
     this.address = s.evm_address;
   }
@@ -267,8 +272,8 @@ export class VaultSignedExecutor {
     const erc20 = this.viem.parseAbi(["function balanceOf(address) view returns (uint256)"]);
     const [eth, weth, usdc, block] = await Promise.all([
       this.pub.getBalance({ address: this.address }),
-      this.pub.readContract({ address: UNI.weth, abi: erc20, functionName: "balanceOf", args: [this.address] }),
-      this.pub.readContract({ address: UNI.usdc, abi: erc20, functionName: "balanceOf", args: [this.address] }),
+      this.pub.readContract({ address: this.uni.weth, abi: erc20, functionName: "balanceOf", args: [this.address] }),
+      this.pub.readContract({ address: this.uni.usdc, abi: erc20, functionName: "balanceOf", args: [this.address] }),
       this.pub.getBlockNumber(),
     ]);
     return { eth, weth, usdc, block };
@@ -291,7 +296,7 @@ export class VaultSignedExecutor {
     let gas = GAS[leg];
     try { gas = (await this.pub.estimateGas({ account: this.address, to, value, data })) * 13n / 10n; } catch { /* e.g. swap before approve is mined */ }
     if (gas > GAS[leg]) gas = GAS[leg];
-    const tx = { type: "eip1559", chainId: 11155111, nonce, maxFeePerGas, maxPriorityFeePerGas, gas, to, value, data };
+    const tx = { type: "eip1559", chainId: this.net.evm.chainId, nonce, maxFeePerGas, maxPriorityFeePerGas, gas, to, value, data };
     const localHash = keccak256(serializeTransaction(tx)).slice(2);
 
     const fee = { nonce, max_fee_per_gas: maxFeePerGas.toString(), max_priority_fee_per_gas: maxPriorityFeePerGas.toString(), gas_limit: Number(gas) };
@@ -333,7 +338,7 @@ export class VaultSignedExecutor {
     const fee = Number(decision.fee_tier || 0);
     if (amountIn === 0n || minOut === 0n) return { ref: null, txs, filled: false, detail: "decision carries no trade size (pre-v2 strategy): nothing to sign" };
     const bal = await this.balances();
-    const [tokenIn, tokenOut] = decision.action === "sell" ? [UNI.weth, UNI.usdc] : [UNI.usdc, UNI.weth];
+    const [tokenIn, tokenOut] = decision.action === "sell" ? [this.uni.weth, this.uni.usdc] : [this.uni.usdc, this.uni.weth];
     // the pool must be able to meet the enclave's floor, or the swap would revert and burn gas
     const quote = await this.quoteExact(tokenIn, tokenOut, amountIn, fee);
     if (quote < minOut) {
@@ -341,15 +346,15 @@ export class VaultSignedExecutor {
         detail: `REFUSED: pool would return ${quote}, below the enclave's slippage floor ${minOut} (Sepolia pools are mispriced vs the oracle)` };
     }
     if (decision.action === "sell" && bal.weth < amountIn) {
-      txs.push(await this.leg(id, "wrap", { to: UNI.weth, value: amountIn, data: "0xd0e30db0" }));
+      txs.push(await this.leg(id, "wrap", { to: this.uni.weth, value: amountIn, data: "0xd0e30db0" }));
     }
-    const allowance = await this.pub.readContract({ address: tokenIn, abi: erc20, functionName: "allowance", args: [this.address, UNI.router] });
+    const allowance = await this.pub.readContract({ address: tokenIn, abi: erc20, functionName: "allowance", args: [this.address, this.uni.router] });
     if (allowance < amountIn) {
-      txs.push(await this.leg(id, "approve", { to: tokenIn, data: encodeFunctionData({ abi: erc20, functionName: "approve", args: [UNI.router, 2n ** 256n - 1n] }) }));
+      txs.push(await this.leg(id, "approve", { to: tokenIn, data: encodeFunctionData({ abi: erc20, functionName: "approve", args: [this.uni.router, 2n ** 256n - 1n] }) }));
     }
     const deadline = BigInt(Math.floor(Date.now() / 1000) + 1200);
     const data = swapCalldata(this.viem, { tokenIn, tokenOut, fee, recipient: this.address, amountIn, minOut, deadline, commitment });
-    const swap = await this.leg(id, "swap", { to: UNI.router, data, deadline });
+    const swap = await this.leg(id, "swap", { to: this.uni.router, data, deadline });
     txs.push(swap);
     const filled = swap.status === "success";
     return { ref: filled ? swap.hash : `reverted:${swap.hash}`, txs, filled,
@@ -359,7 +364,7 @@ export class VaultSignedExecutor {
   async quoteExact(tokenIn, tokenOut, amountIn, fee) {
     const quoterAbi = this.viem.parseAbi(["function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256 amountOut,uint160,uint32,uint256)"]);
     try {
-      const { result } = await this.pub.simulateContract({ address: UNI.quoter, abi: quoterAbi, functionName: "quoteExactInputSingle",
+      const { result } = await this.pub.simulateContract({ address: this.uni.quoter, abi: quoterAbi, functionName: "quoteExactInputSingle",
         args: [{ tokenIn, tokenOut, amountIn, fee, sqrtPriceLimitX96: 0n }] });
       return result[0];
     } catch { return 0n; }

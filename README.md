@@ -100,7 +100,7 @@ investor ──deposit──► Vault contract (NEAR, near-sdk Rust)
 ## Run everything (no network needed)
 
 ```bash
-cargo test --workspace          # 54 Rust tests incl. a property-based fuzz of the money invariants
+cargo test --workspace          # 56 Rust tests incl. a property-based fuzz of the money invariants
 (cd executor && npm ci)         # once
 node executor/test.mjs          # 4 executor tests incl. a full local-enclave cycle
 node executor/run.mjs           # one full cycle, offline: enclave -> commit -> reveal -> proof

@@ -1,10 +1,15 @@
 // Live mode: read a deployed vault straight from NEAR JSON-RPC — no SDK, no
 // build step, no server. Open index.html?vault=<contract-id>[&rpc=<url>].
 
-const DEFAULT_RPC = "https://rpc.testnet.near.org";
+export const isTestnet = (id) => id.endsWith(".testnet");
+/** Same rule as the contract: a .testnet vault trades on Sepolia, a mainnet vault on Base. */
+export const netOf = (id) => (isTestnet(id)
+  ? { near: "testnet", rpc: "https://rpc.testnet.near.org", evm: "Sepolia", evmRpc: "https://ethereum-sepolia-rpc.publicnode.com", explorer: "https://sepolia.etherscan.io", usdc: "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238", intentsUsdc: "nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near" }
+  : { near: "mainnet", rpc: "https://rpc.mainnet.near.org", evm: "Base", evmRpc: "https://base-rpc.publicnode.com", explorer: "https://basescan.org", usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", intentsUsdc: "nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near" });
 
 export class LiveVault {
-  constructor(contractId, rpcUrl = DEFAULT_RPC) {
+  constructor(contractId, rpcUrl) {
+    rpcUrl = rpcUrl ?? netOf(contractId).rpc;
     this.contractId = contractId;
     this.rpc = rpcUrl;
   }

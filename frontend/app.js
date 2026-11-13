@@ -4,7 +4,7 @@
 //   default                      — demo fixtures (real proofs, simulated market)
 //   ?vault=<contract>[&rpc=url]  — live NEAR testnet state, pinned above demo rows
 import { runAllChecks, checkCodeAttested, checkCommitment } from "./verify.js";
-import { LiveVault } from "./near-rpc.mjs";
+import { LiveVault, netOf } from "./near-rpc.mjs";
 import * as W from "./wallet.mjs";
 
 const $ = (s, el = document) => el.querySelector(s);
@@ -183,7 +183,7 @@ async function renderVault(id) {
           <div><span class="lbl">salt</span>&nbsp; ${c.salt_hex} ${copyBtn(c.salt_hex)}</div>` : ""}
           ${c.reject_reason ? `<div class="v-bad" style="margin-top:6px">refused by guardrails: ${esc(c.reject_reason)}</div>` : ""}
           ${c.attestation_ref ? `<div style="margin-top:6px"><span class="lbl">attestation</span>&nbsp; ${c.attestation_ref.startsWith("https://") ? `<a href="${esc(c.attestation_ref)}" target="_blank" rel="noopener">${esc(c.attestation_ref)}</a>` : esc(c.attestation_ref)} <span class="lbl">· wasm</span> ${short(c.wasm_hash)}</div>` : ""}
-          ${c.execution_ref ? `<div><span class="lbl">target-chain tx</span>&nbsp; ${c.execution_ref.startsWith("0x") ? `<a href="https://sepolia.etherscan.io/tx/${esc(c.execution_ref)}" target="_blank" rel="noopener">${esc(c.execution_ref)}</a> <span class="lbl">(Uniswap v3 on Sepolia; the last 32 bytes of its calldata are this commitment)</span>` : esc(c.execution_ref)}</div>` : ""}
+          ${c.execution_ref ? `<div><span class="lbl">target-chain tx</span>&nbsp; ${c.execution_ref.startsWith("0x") ? `<a href="${netOf(v.id).explorer}/tx/${esc(c.execution_ref)}" target="_blank" rel="noopener">${esc(c.execution_ref)}</a> <span class="lbl">(Uniswap v3 on ${netOf(v.id).evm}; the last 32 bytes of its calldata are this commitment)</span>` : esc(c.execution_ref)}</div>` : ""}
           ${c.input_json ? (() => { const o = JSON.parse(c.input_json).oracle; return o ? `<div><span class="lbl">prices the enclave saw</span>&nbsp; ETH $${o.eth_usd} · NEAR $${o.near_usd} · ${esc(o.spot_source)} @ ${new Date(o.as_of * 1000).toISOString().slice(0, 16).replace("T", " ")} UTC</div>` : ""; })() : ""}
         </div>
         ${c.revealed ? `<button data-recompute="${c.id}">Recompute this hash</button><span class="check-line" id="recompute-${c.id}" role="status"></span>` : ""}
@@ -223,7 +223,7 @@ async function renderVault(id) {
           <dt>pairs</dt><dd>${g.allowed_pairs.map(esc).join(", ")}</dd>
           <dt>net asset value</dt><dd>${v.pool_near} NEAR</dd>
           ${v.external_near != null ? `<dt>· on NEAR</dt><dd>${v.local_near} NEAR</dd><dt>· cross-chain</dt><dd>${v.external_near} NEAR</dd>` : ""}
-          ${v.evm_address ? `<dt>cross-chain wallet</dt><dd style="font-size:11px"><a href="https://sepolia.etherscan.io/address/${esc(v.evm_address)}" target="_blank" rel="noopener">${esc(v.evm_address.slice(0, 10))}…</a> (vault-owned)</dd>` : ""}
+          ${v.evm_address ? `<dt>cross-chain wallet</dt><dd style="font-size:11px"><a href="${netOf(v.id).explorer}/address/${esc(v.evm_address)}" target="_blank" rel="noopener">${esc(v.evm_address.slice(0, 10))}…</a> (vault-owned)</dd>` : ""}
           ${v.last_settlement_ref ? `<dt>last settlement</dt><dd style="font-size:11px">${esc(v.last_settlement_ref.slice(0, 34))}…</dd>` : ""}
           ${v.last_attested_ms ? `<dt>exit guarantee</dt><dd style="font-size:11.5px">${v.emergency ? "EMERGENCY — withdraw pro rata" : `anyone may trigger exit if silent ${Math.round(v.liveness_timeout_ms / 3.6e6)}h (last: ${when(v.last_attested_ms)})`}</dd>` : ""}
           ${v.mode ? `<dt>trust mode</dt><dd>${v.mode === "Attested" ? "attested: only TDX-delivered output can act" : `relayed by <span title="openly trusted to deliver enclave output on time">${esc(v.executor ?? "executor")}</span>`}</dd>` : ""}
@@ -272,12 +272,12 @@ async function loadWayBack(v) {
   const el = document.getElementById("way-back");
   if (!el) return;
   try {
-    const bal = await fetch("https://ethereum-sepolia-rpc.publicnode.com", { method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238", data: "0x70a08231" + v.evm_address.slice(2).toLowerCase().padStart(64, "0") }, "latest"] }) }).then((r) => r.json());
+    const bal = await fetch(netOf(v.id).evmRpc, { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: netOf(v.id).usdc, data: "0x70a08231" + v.evm_address.slice(2).toLowerCase().padStart(64, "0") }, "latest"] }) }).then((r) => r.json());
     const usdc = BigInt(bal.result || "0x0");
     if (usdc === 0n) { el.textContent = "NEAR Intents: nothing cross-chain to bring back right now"; return; }
     const q = await fetch("https://1click.chaindefuser.com/v0/quote", { method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ dry: true, swapType: "EXACT_INPUT", slippageTolerance: 100, originAsset: "nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near",
+      body: JSON.stringify({ dry: true, swapType: "EXACT_INPUT", slippageTolerance: 100, originAsset: netOf(v.id).intentsUsdc,
         depositType: "ORIGIN_CHAIN", destinationAsset: "nep141:wrap.near", amount: usdc.toString(), refundTo: v.evm_address, refundType: "ORIGIN_CHAIN",
         recipient: v.id.endsWith(".near") ? v.id : "wrap.near", recipientType: "DESTINATION_CHAIN", deadline: new Date(Date.now() + 3600e3).toISOString() }) }).then((r) => r.json());
     if (!q.quote) throw new Error(q.message || "no quote");
@@ -293,7 +293,7 @@ async function renderPosition(v) {
   const acct = W.currentAccount();
   if (!acct) {
     box.innerHTML = `<h3>Your position</h3>
-      <p style="margin:0 0 12px">Connect a NEAR <b>testnet</b> wallet to deposit, see your shares, and withdraw.</p>
+      <p style="margin:0 0 12px">Connect a NEAR <b>${netOf(v.id).near}</b> wallet to deposit, see your shares, and withdraw.</p>
       <button class="primary" data-act="connect">Connect wallet</button>`;
     return;
   }

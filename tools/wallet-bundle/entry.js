@@ -8,7 +8,7 @@ import { setupIntearWallet } from "@near-wallet-selector/intear-wallet";
 
 export async function initWallet(contractId) {
   const selector = await setupWalletSelector({
-    network: "testnet",
+    network: contractId.endsWith(".testnet") ? "testnet" : "mainnet",
     modules: [setupMeteorWallet(), setupMyNearWallet(), setupIntearWallet()],
   });
   const modal = setupModal(selector, { contractId });

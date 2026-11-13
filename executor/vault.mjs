@@ -1,3 +1,4 @@
+import { netFor } from "./net.mjs";
 // Vault providers: where commitments land.
 //
 // NearVault — the real contract on NEAR testnet (near-api-js).
@@ -13,8 +14,8 @@ export class NearVault {
    */
   constructor(cfg) {
     this.cfg = {
-      networkId: "testnet",
-      nodeUrl: "https://rpc.testnet.near.org",
+      networkId: netFor(cfg.contractId).near,
+      nodeUrl: netFor(cfg.contractId).nearRpc,
       ...cfg,
     };
     this._account = null;

@@ -75,6 +75,7 @@ storage.
 
 ## Residual risks (stated, not hidden)
 
+- **Closing returns the storage stake, and only from an empty vault.** With the keys deleted, the ~4 NEAR NEAR locks for the contract's storage could never come back. So `propose_close` announces a close 48h ahead (deposits stop at once), and `close_vault` then works only when no shares remain and nothing is reported cross-chain. The contract deletes its own account and returns the stake to the proposer, who must still hold the strategy NFT. Holders' exits (withdraw, claims, payout retries) stay open throughout.
 - **Until Saturday the vault account still has a full-access key.** Whoever holds it can replace the code. We delete it after the final deploy. After that, code changes take 48h and are public (`propose_code`).
 - **Relayed mode trusts the relayer for liveness and for the chart.** It can withhold runs (the 24h liveness rule then lets anyone trigger emergency exit) or misreport the cross-chain valuation shown on the NAV chart. It can't move NEAR, price deposits, cash fees, size trades or pick a trade the enclave didn't commit.
 - **Attested mode works, but isn't switched on until strategy v2 applies (Sat 14 Nov).** We had blamed OutLayer's testnet worker for never answering on-chain calls. The real cause was ours: `request_decision` passed empty `resource_limits`, and OutLayer's default budget (1e9 instructions) aborts the strategy mid-Bulletproof (it needs ~2.3e9). With an explicit 5e9 budget the vault's own on-chain path works (commitment #18, ~20s round trip).

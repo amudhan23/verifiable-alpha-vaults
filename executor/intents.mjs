@@ -15,15 +15,18 @@
 // env: NEAR_ACCOUNT_ID, NEAR_PRIVATE_KEY, VAULT_CONTRACT_ID, NEAR_RPC, ONECLICK_JWT (optional; avoids the fee)
 import { NearVault } from "./vault.mjs";
 import { VaultSignedExecutor } from "./evm.mjs";
+import { netFor } from "./net.mjs";
 
 const ONECLICK = process.env.ONECLICK_URL ?? "https://1click.chaindefuser.com";
 // Ethereum mainnet USDC and NEAR (wNEAR) as 1Click asset ids
-const ETH_USDC = "nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near";
+// USDC on the vault's trading chain (Base for mainnet vaults; testnet prices the Ethereum route)
 const WNEAR = "nep141:wrap.near";
 
 const cmd = process.argv[2] ?? "quote";
 const arg = (k, d) => { const i = process.argv.indexOf(`--${k}`); return i > 0 ? process.argv[i + 1] : d; };
 const vaultId = process.env.VAULT_CONTRACT_ID;
+const NET = netFor(vaultId ?? "");
+const ETH_USDC = NET.intentsUsdc;
 const mainnet = vaultId?.endsWith(".near");
 const vault = new NearVault({ contractId: vaultId, accountId: process.env.NEAR_ACCOUNT_ID, privateKey: process.env.NEAR_PRIVATE_KEY,
   nodeUrl: process.env.NEAR_RPC ?? (mainnet ? "https://rpc.mainnet.fastnear.com" : "https://test.rpc.fastnear.com"), networkId: mainnet ? "mainnet" : "testnet" });
@@ -75,7 +78,7 @@ async function main() {
     await evm.init();
     const erc20 = evm.viem.parseAbi(["function transfer(address,uint256) returns (bool)"]);
     const data = evm.viem.encodeFunctionData({ abi: erc20, functionName: "transfer", args: [e.deposit_address, BigInt(e.amount_usdc)] });
-    const usdc = mainnet ? "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" : "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238";
+    const usdc = NET.uni.usdc;
     const t = await evm.leg(0, "exit", { to: usdc, data, method: "sign_exit_tx" });
     console.log(`exit transfer ${t.status}: ${t.hash}. Track: node intents.mjs status`);
   } else if (cmd === "status") {
@@ -92,7 +95,7 @@ async function main() {
     const near = arg("near", /^[0-9.]+$/.test(process.argv[3] ?? "") ? process.argv[3] : "0.05");
     const yocto = BigInt(Math.round(Number(near) * 1e6)) * 10n ** 18n;
     const acct = await vault.account();
-    const wrap = "wrap.testnet";
+    const wrap = NET.wrap;
     await acct.functionCall({ contractId: wrap, methodName: "storage_deposit", args: { account_id: vaultId, registration_only: true }, gas: 30_000_000_000_000n, attachedDeposit: 1_250_000_000_000_000_000_000n });
     if (!process.argv.includes("--resend")) await acct.functionCall({ contractId: wrap, methodName: "near_deposit", args: {}, gas: 30_000_000_000_000n, attachedDeposit: yocto });
     // wrap.testnet keeps a storage fee on first deposit: send what we actually hold

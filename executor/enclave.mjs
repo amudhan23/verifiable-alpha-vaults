@@ -1,3 +1,4 @@
+import { netFor } from "./net.mjs";
 // Enclave providers: where the sealed strategy actually runs.
 //
 // OutLayerEnclave — the real thing: OutLayer testnet HTTPS API, Intel TDX,
@@ -14,7 +15,7 @@ export class OutLayerEnclave {
    * @param {{baseUrl?:string, owner:string, project:string, paymentKey:string, secretsProfile?:string}} cfg
    */
   constructor(cfg) {
-    this.base = cfg.baseUrl ?? "https://testnet-api.outlayer.ai";
+    this.base = cfg.baseUrl ?? netFor(cfg.owner ?? cfg.accountId ?? "x.testnet").outlayerApi;
     this.owner = cfg.owner;
     this.project = cfg.project;
     this.key = cfg.paymentKey;

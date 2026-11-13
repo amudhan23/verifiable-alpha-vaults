@@ -4,7 +4,7 @@
 // Every action is an ordinary transaction to the vault contract, signed in
 // the user's own wallet. The frontend never holds keys.
 
-const RPC = "https://rpc.testnet.near.org";
+const rpcFor = (id) => (id?.endsWith(".testnet") ? "https://rpc.testnet.near.org" : "https://rpc.mainnet.near.org");
 const YOCTO = 10n ** 24n;
 const GAS = "100000000000000"; // 100 Tgas
 
@@ -74,7 +74,7 @@ export const claimExternal = () => call("claim_external", {});
 export const retryPayout = () => call("retry_payout", {});
 
 async function view(contractId, method, args) {
-  const res = await fetch(RPC, {
+  const res = await fetch(rpcFor(contractId), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "query", params: {

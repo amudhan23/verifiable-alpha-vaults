@@ -88,6 +88,7 @@ pub const MAX_DEADLINE_S: u64 = 3_600;
 pub const EXIT_DELAY_MS: u64 = 24 * 3_600_000;
 const GAS_CAP_EXIT: u64 = 120_000;
 const EXIT_KEY: &[u8] = b"exit";
+const CLOSE_KEY: &[u8] = b"close";
 const NAV_LOG_CAP: u32 = 2_000;
 /// Fixed unit count created with the first external value (1e24): with
 /// ACC_SCALE 1e24, repatriations up to ~1e14 NEAR stay inside u128.
@@ -101,11 +102,37 @@ const MAX_DECISION_JSON: usize = 600;
 
 // EVM execution target: Ethereum Sepolia, Uniswap v3 (addresses verified
 // on-chain). The vault will only ever sign transactions to these.
-pub const EVM_CHAIN_ID: u64 = 11_155_111;
-pub const MPC_SIGNER: &str = "v1.signer-prod.testnet";
-const WETH: [u8; 20] = hex20("fff9976782d46cc05630d1f6ebab18b2324d6b14");
-const USDC: [u8; 20] = hex20("1c7d4b196cb0c7b01d743fbc6116a902379c7238");
-const ROUTER: [u8; 20] = hex20("3bfa4769fb09eefc5a80d6e87c3b9c650f7ae48e");
+/// Network settings, chosen from the vault's own account id: a `.testnet`
+/// vault trades on Sepolia through the testnet MPC signer and OutLayer; any
+/// other (mainnet) vault trades on Base through the mainnet ones. One build,
+/// no admin switch: nobody can point a deployed vault at another chain.
+pub struct Net {
+    pub evm_chain_id: u64,
+    pub mpc_signer: &'static str,
+    pub outlayer: &'static str,
+    pub weth: [u8; 20],
+    pub usdc: [u8; 20],
+    pub router: [u8; 20],
+}
+pub const SEPOLIA: Net = Net {
+    evm_chain_id: 11_155_111,
+    mpc_signer: "v1.signer-prod.testnet",
+    outlayer: "outlayer.testnet",
+    weth: hex20("fff9976782d46cc05630d1f6ebab18b2324d6b14"),
+    usdc: hex20("1c7d4b196cb0c7b01d743fbc6116a902379c7238"),
+    router: hex20("3bfa4769fb09eefc5a80d6e87c3b9c650f7ae48e"),
+};
+pub const BASE: Net = Net {
+    evm_chain_id: 8_453,
+    mpc_signer: "v1.signer",
+    outlayer: "outlayer.near",
+    weth: hex20("4200000000000000000000000000000000000006"),
+    usdc: hex20("833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+    router: hex20("2626664c2603336e57b271c5c0b26f421741e481"),
+};
+pub fn net() -> &'static Net {
+    if env::current_account_id().as_str().ends_with(".testnet") { &SEPOLIA } else { &BASE }
+}
 const MAX_FEE_PER_GAS: u128 = 100_000_000_000; // 100 gwei
 /// Per-leg gas caps (gas is paid from the vault's own ETH).
 const GAS_CAP_WRAP: u64 = 250_000;
@@ -580,6 +607,7 @@ impl Vault {
         require!(!self.deposits_paused, "deposits are paused (integrity alert)");
         let amount = env::attached_deposit().as_yoctonear();
         require!(amount >= MIN_DEPOSIT, "minimum deposit is 0.1 NEAR");
+        require!(env::storage_read(CLOSE_KEY).is_none(), "this vault is closing: deposits are off");
         // A cross-chain valuation can never price a deposit: new money only
         // comes in while every yocto of NAV is NEAR held by this contract.
         require!(
@@ -739,9 +767,9 @@ impl Vault {
         data.extend(evm::word_addr(&parse_evm_address(&e.deposit_address)));
         data.extend(evm::word_u128(e.amount_usdc.0));
         let tx = evm::Tx1559 {
-            chain_id: EVM_CHAIN_ID, nonce,
+            chain_id: net().evm_chain_id, nonce,
             max_priority_fee_per_gas: max_priority_fee_per_gas.0, max_fee_per_gas: max_fee_per_gas.0,
-            gas_limit, to: USDC, value: 0, data,
+            gas_limit, to: net().usdc, value: 0, data,
         };
         let payload_hex = hex::encode(env::keccak256(&tx.signing_bytes()));
         e.signed = true;
@@ -752,7 +780,7 @@ impl Vault {
         let att = env::attached_deposit().as_yoctonear();
         require!(att > storage, "attach enough for storage plus the MPC signing fee");
         let args = serde_json::json!({"request": {"payload_v2": {"Ecdsa": payload_hex}, "path": self.mpc_path, "domain_id": 0}});
-        Promise::new(MPC_SIGNER.parse().unwrap())
+        Promise::new(net().mpc_signer.parse().unwrap())
             .function_call("sign".to_string(), args.to_string().into_bytes(), NearToken::from_yoctonear(att - storage), Gas::from_tgas(200))
             .then(Self::ext(env::current_account_id()).with_static_gas(Gas::from_tgas(15)).on_signed(key, payload_hex))
     }
@@ -1001,28 +1029,29 @@ impl Vault {
         let key = format!("{id}:{leg}");
         require!(self.signed_legs.get(&key).is_none(), "this leg was already signed for this decision");
         let me = parse_evm_address(&self.evm_address);
-        let (token_in, token_out) = if d.action == "sell" { (WETH, USDC) } else { (USDC, WETH) };
+        let n = net();
+        let (token_in, token_out) = if d.action == "sell" { (n.weth, n.usdc) } else { (n.usdc, n.weth) };
         let (to, value, data, cap) = match leg.as_str() {
             "wrap" => {
                 require!(d.action == "sell", "wrap is only needed to sell ETH");
-                (WETH, amount_in, hex::decode("d0e30db0").unwrap(), GAS_CAP_WRAP)
+                (n.weth, amount_in, hex::decode("d0e30db0").unwrap(), GAS_CAP_WRAP)
             }
             "approve" => {
                 let mut data = hex::decode("095ea7b3").unwrap();
-                data.extend(evm::word_addr(&ROUTER));
+                data.extend(evm::word_addr(&n.router));
                 data.extend(evm::word_max());
                 (token_in, 0, data, GAS_CAP_APPROVE)
             }
             "swap" => {
                 let now_s = env::block_timestamp_ms() / 1_000;
                 require!(deadline_s > now_s && deadline_s <= now_s + MAX_DEADLINE_S, "deadline must be within the next hour");
-                (ROUTER, 0, evm::swap_calldata(&token_in, &token_out, d.fee_tier, &me, amount_in, min_out, deadline_s, &c.commitment), GAS_CAP_SWAP)
+                (n.router, 0, evm::swap_calldata(&token_in, &token_out, d.fee_tier, &me, amount_in, min_out, deadline_s, &c.commitment), GAS_CAP_SWAP)
             }
             _ => env::panic_str("leg must be wrap | approve | swap"),
         };
         require!(gas_limit <= cap, "gas_limit above this leg's cap");
         let tx = evm::Tx1559 {
-            chain_id: EVM_CHAIN_ID,
+            chain_id: n.evm_chain_id,
             nonce,
             max_priority_fee_per_gas: max_priority_fee_per_gas.0,
             max_fee_per_gas: max_fee_per_gas.0,
@@ -1043,7 +1072,7 @@ impl Vault {
         let args = serde_json::json!({"request": {
             "payload_v2": {"Ecdsa": payload_hex}, "path": self.mpc_path, "domain_id": 0,
         }});
-        Promise::new(MPC_SIGNER.parse().unwrap())
+        Promise::new(net().mpc_signer.parse().unwrap())
             .function_call("sign".to_string(), args.to_string().into_bytes(), NearToken::from_yoctonear(att - storage), Gas::from_tgas(200))
             .then(Self::ext(env::current_account_id()).with_static_gas(Gas::from_tgas(15)).on_signed(key, payload_hex))
     }
@@ -1187,7 +1216,7 @@ impl Vault {
             "input_data": input_json,
             "secrets_ref": { "profile": "default", "account_id": self.owner },
         });
-        Promise::new("outlayer.testnet".parse().unwrap())
+        Promise::new(net().outlayer.parse().unwrap())
             .function_call("request_execution".to_string(), args.to_string().into_bytes(), NearToken::from_yoctonear(att - ATTESTED_STORAGE_RESERVE), Gas::from_tgas(150))
             .then(Self::ext(env::current_account_id()).with_static_gas(Gas::from_tgas(60)).on_decision(input_json))
     }
@@ -1378,6 +1407,42 @@ impl Vault {
             .function_call("migrate".to_string(), b"{}".to_vec(), NearToken::from_yoctonear(0), Gas::from_tgas(80))
     }
 
+    // ==================================================================
+    // Closing: the only way the locked storage NEAR ever comes back once the
+    // account's keys are deleted. Public 48h ahead; only an EMPTY vault.
+    // ==================================================================
+
+    pub fn get_close(&self) -> Option<Proposal> {
+        env::storage_read(CLOSE_KEY).and_then(|b| near_sdk::borsh::from_slice(&b).ok())
+    }
+
+    /// Manager: announce closing. Deposits stop at once; holders keep every
+    /// exit (withdraw, claim, retry payouts) for the 48h and after.
+    pub fn propose_close(&mut self) {
+        self.assert_manager();
+        let p = self.proposal("close".into(), String::new());
+        emit("close_proposed", serde_json::json!({"effective_at_ms": p.effective_at_ms}));
+        env::storage_write(CLOSE_KEY, &near_sdk::borsh::to_vec(&p).unwrap());
+    }
+
+    pub fn cancel_close(&mut self) {
+        self.assert_manager();
+        env::storage_remove(CLOSE_KEY);
+        emit("close_cancelled", serde_json::json!({}));
+    }
+
+    /// Anyone, after 48h, once nobody holds shares and nothing is reported
+    /// cross-chain: the contract deletes its own account and the storage
+    /// stake goes to the strategy NFT holder who proposed it.
+    pub fn close_vault(&mut self) -> Promise {
+        let p = self.get_close().unwrap_or_else(|| env::panic_str("no close proposed"));
+        self.check_due(&p);
+        require!(self.total_shares == 0, "holders still have money in the vault: it can't close");
+        require!(self.ext_value == 0, "value is still reported cross-chain: bring it back first");
+        emit("vault_closed", serde_json::json!({"beneficiary": p.proposer}));
+        Promise::new(env::current_account_id()).delete_account(p.proposer)
+    }
+
     pub fn cancel_proposals(&mut self) {
         self.assert_manager();
         self.pending_strategy = None;
@@ -1471,6 +1536,7 @@ impl Vault {
             "pending_relayed": self.pending_relayed,
             "pending_code": self.pending_code,
             "exit": self.get_exit(),
+            "closing": self.get_close(),
             "deposits_open": !self.emergency && !self.deposits_paused && self.ext_value == 0,
             "commitments": self.commitments.len(),
             "risk_proofs": self.risk_proofs.len(),

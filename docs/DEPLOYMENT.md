@@ -144,3 +144,11 @@ Found during the rehearsal, and fixed on both vaults before Saturday:
   - Tests: 25 unit tests, with 2 new ones for this leg.
 - **Live on testnet:** the arrival half ran on the main vault. A wrap.testnet `ft_transfer` stood in for the Intents delivery (tx `Aef66ZUY…`), then `unwrap_and_repatriate` (tx `AFfuBsgvysevy8JVU5YRRB73ie5y14G5PubfqZ99kZUK`) unwrapped 0.04875 NEAR and credited it to the pool.
 - **Mainnet only:** the send half (a real 1Click deposit address) needs mainnet, because NEAR Intents has no testnet deployment.
+
+## Mainnet-ready (13 Nov)
+
+- **One build, two networks.** The network is chosen from the vault's own account ID, with no setting anyone can change. `.testnet` means Ethereum Sepolia, `v1.signer-prod.testnet` and `outlayer.testnet`. Any mainnet account means **Base** (chain 8453), `v1.signer` and `outlayer.near`. Base uses Uniswap v3's SwapRouter02 `0x2626664c…e481`, QuoterV2 `0x3d4e44Eb…B76a`, WETH `0x4200…0006` and USDC `0x8335…2913`.
+- **`close_vault`.** Announced 48h ahead with `propose_close`. It works only on an empty vault and returns the ~4 NEAR storage stake to the strategy NFT holder. That lets the keys be deleted without losing the stake.
+- **Executor and site.** `executor/net.mjs` mirrors the contract's rule, and the site follows the vault's network for RPC, wallet, explorer and the NEAR Intents route.
+- **Address derivation checked against the mainnet MPC network:** a vault at `vault.alpha-vaults.near` would own `0x6Ccc100F8B44d2e8eCe31fE1617C3979C2Ad6521` on Base.
+- **Budget for a manager-only mainnet vault:** about 4.5 NEAR (≈4.1 of it the storage stake, recoverable through `close_vault`) plus about $4 on Base ($3 USDC, $1 ETH). The attested on-chain path pays OutLayer in NEAR, so no payment key is needed.

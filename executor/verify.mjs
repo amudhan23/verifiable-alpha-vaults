@@ -11,11 +11,13 @@ import { readFileSync } from "node:fs";
 import { LiveVault } from "../frontend/near-rpc.mjs";
 import * as V from "../frontend/verify.js";
 import * as proofs from "../frontend/pkg/vault_proofs.js";
+import { netFor } from "./net.mjs";
 
 const arg = (k, d) => { const i = process.argv.indexOf(`--${k}`); return i > 0 ? process.argv[i + 1] : d; };
 const vaultId = arg("vault", "vault.alpha-vaults-23.testnet");
-const rpc = arg("rpc", "https://test.rpc.fastnear.com");
-const sepolia = arg("sepolia", "https://ethereum-sepolia-rpc.publicnode.com");
+const NET = netFor(vaultId);
+const rpc = arg("rpc", NET.nearRpc);
+const sepolia = arg("evm-rpc", NET.evm.rpc);
 
 const C = process.stdout.isTTY ? { g: "\x1b[32m", r: "\x1b[31m", y: "\x1b[33m", d: "\x1b[2m", b: "\x1b[1m", x: "\x1b[0m" } : { g: "", r: "", y: "", d: "", b: "", x: "" };
 const mark = { ok: `${C.g}✓${C.x}`, bad: `${C.r}✗${C.x}`, wait: `${C.y}…${C.x}` };
@@ -76,7 +78,7 @@ async function main() {
   report("2. Every decision committed before it executed", await V.checkTradesCommitted(vault));
   report("3. Risk limits held (Bulletproofs, verified here)", await V.checkRiskProven(vault));
   report("4. Real market prices went in", await V.checkPricesVerified(vault));
-  report("5. Swaps on Sepolia match their commitments", await checkSwapsCarryCommitments(vault));
+  report(`5. Swaps on ${NET.evm.name} match their commitments`, await checkSwapsCarryCommitments(vault));
   report("6. The vault can pay every holder", await checkSolvency(lv));
   const bad = results.filter((r) => r === "bad").length, wait = results.filter((r) => r === "wait").length;
   console.log(`\n${bad ? `${C.r}${bad} check(s) FAILED${C.x}` : `${C.g}${results.length - wait}/${results.length} passed${C.x}`}${wait ? ` · ${wait} not applicable / unreachable` : ""}`);

@@ -86,6 +86,8 @@ Most recent output (13 Nov), main vault:
 | If the vault goes silent for 24h, anyone can trigger a one-way emergency exit | `trigger_emergency` | `emergency_is_permissionless_one_way_and_withdrawals_still_work` |
 | The vault's EVM wallet is fixed; swaps pay only the vault | no rotation exists; recipient hard-wired in `swap_calldata` | `swap_calldata_is_a_deadlined_multicall_paying_the_vault` |
 | Cross-chain value comes back as NEAR (NEAR Intents) | `propose_exit` (public 24h, proposer-bound) → `sign_exit_tx` (one transfer) → `unwrap_and_repatriate` | `exit_via_near_intents_is_public_for_24h_signed_once_and_bound_to_the_proposer`, `unwrapped_near_from_intents_is_credited_like_repatriation` |
+| The storage stake only comes back when the vault is empty | `propose_close` (public 48h, deposits stop) → `close_vault` only when no shares remain and nothing is reported cross-chain; the contract deletes its own account | `close_is_public_48h_stops_deposits_and_needs_an_empty_vault` |
+| Nobody can point a vault at another chain | the network is chosen from the vault's own account id (`.testnet` → Sepolia, otherwise Base); there is no setter | `network_is_chosen_by_the_vault_account_not_by_anyone` |
 | The relayer pays for every byte it writes | `charge_storage` on every relayed write | live: every relayed call attaches a deposit; the unused part is refunded |
 
 The NEAR Intents arrival half ran live: tx `AFfuBsgvysevy8JVU5YRRB73ie5y14G5PubfqZ99kZUK` unwrapped 0.04875 NEAR and credited it to holders. Live 1Click quote: `node executor/intents.mjs quote`.
@@ -103,7 +105,7 @@ Read these before you trust anything above. Each is explained in [`docs/SECURITY
 ## Re-run everything
 
 ```bash
-cargo test --workspace                 # 54 Rust tests incl. a property-based fuzz of the money invariants
+cargo test --workspace                 # 56 Rust tests incl. a property-based fuzz of the money invariants
 (cd executor && npm ci && node test.mjs)  # executor tests incl. a full local-enclave cycle
 node executor/verify.mjs               # the six live checks, read-only
 ```
