@@ -58,6 +58,7 @@ export class LiveVault {
       local_near: toNear(s.pool_yocto),
       external_near: toNear(s.external_value_yocto ?? "0"),
       evm_address: s.evm_address,
+      exit: s.exit ?? null,
       version: s.version,
       last_settlement_ref: s.last_settlement_ref,
       last_attested_ms: s.last_attested_ms,

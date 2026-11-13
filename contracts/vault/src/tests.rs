@@ -450,6 +450,62 @@ fn attested_full_output_anchors_proofs_and_relayer_can_only_reveal_what_was_comm
 }
 
 #[test]
+fn exit_via_near_intents_is_public_for_24h_signed_once_and_bound_to_the_proposer() {
+    let mut v = new_vault();
+    at(alice(), 10 * NEAR, 1_000);
+    v.deposit();
+    let dep = "0x1111111111111111111111111111111111111111".to_string();
+    ctx(mallory(), NEAR / 10);
+    assert!(panics(|| v.propose_exit(dep.clone(), U128(57_940_000), "q".into())), "manager only");
+    at(owner(), NEAR / 10, 2_000);
+    v.propose_exit(dep.clone(), U128(57_940_000), "1click:abc".into());
+    assert_eq!(v.get_summary()["exit"]["deposit_address"], dep);
+    let gwei = 1_000_000_000u128;
+    at(executor(), NEAR / 100, 2_000 + EXIT_DELAY_MS - 1);
+    assert!(panics(|| { let _ = v.sign_exit_tx(0, U128(10 * gwei), U128(gwei), 100_000); }), "24h public first");
+    at(executor(), NEAR / 100, 2_000 + EXIT_DELAY_MS);
+    assert!(panics(|| { let _ = v.sign_exit_tx(0, U128(10 * gwei), U128(gwei), GAS_CAP_EXIT + 1); }), "gas cap");
+    let _ = v.sign_exit_tx(0, U128(10 * gwei), U128(gwei), 100_000);
+    assert!(get_logs().iter().any(|l| l.contains("evm_sign_requested") && l.contains("exit")));
+    at(executor(), NEAR / 100, 2_000 + EXIT_DELAY_MS + 1);
+    assert!(panics(|| { let _ = v.sign_exit_tx(1, U128(10 * gwei), U128(gwei), 100_000); }), "signed once");
+    // a proposal lapses if the NFT is sold
+    at(owner(), NEAR / 10, 3_000_000);
+    v.propose_exit(dep.clone(), U128(1), "q2".into());
+    at(owner(), 1, 3_000_001);
+    v.nft_transfer(alice(), STRATEGY_TOKEN_ID.into(), None, None);
+    at(executor(), NEAR / 100, 3_000_000 + EXIT_DELAY_MS);
+    assert!(panics(|| { let _ = v.sign_exit_tx(2, U128(10 * gwei), U128(gwei), 100_000); }));
+}
+
+#[test]
+fn unwrapped_near_from_intents_is_credited_like_repatriation() {
+    let mut v = new_vault();
+    at(alice(), 10 * NEAR, 1_000);
+    v.deposit();
+    at(executor(), NEAR / 10, 2_000);
+    v.settle_pnl(U128(NEAR / 2), 1, "a".into());
+    let pool0 = v.pool;
+    testing_env!(
+        VMContextBuilder::new().current_account_id(vault_id()).predecessor_account_id(vault_id())
+            .account_balance(NearToken::from_yoctonear(u128::MAX / 4)).block_timestamp(3_000 * 1_000_000).build(),
+        near_sdk::test_vm_config(), near_sdk::RuntimeFeesConfig::test(), Default::default(),
+        vec![PromiseResult::Successful(vec![])],
+    );
+    assert_eq!(v.on_unwrapped(U128(NEAR / 2)).0, NEAR / 2);
+    assert_eq!(v.ext_value, 0, "the value is home");
+    assert_eq!(v.pool, pool0 + NEAR / 2);
+    assert_eq!(v.get_summary()["deposits_open"], true);
+    // a failed unwrap credits nothing
+    testing_env!(
+        VMContextBuilder::new().current_account_id(vault_id()).predecessor_account_id(vault_id()).build(),
+        near_sdk::test_vm_config(), near_sdk::RuntimeFeesConfig::test(), Default::default(),
+        vec![PromiseResult::Failed],
+    );
+    assert_eq!(v.on_unwrapped(U128(NEAR)).0, 0);
+}
+
+#[test]
 fn code_upgrade_is_timelocked_and_hash_bound() {
     let mut v = new_vault();
     at(owner(), 0, 0);

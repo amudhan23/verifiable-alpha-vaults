@@ -26,6 +26,10 @@ Two independent reviews attacked the vault. The first found **3 Critical issues 
   - Withdrawals pay an exact pool slice.
   - The vault's EVM wallet can never change.
   - The relayer pays for every byte it writes.
+- **The way back** (DeFi track): cross-chain USDC returns as NEAR through **NEAR Intents**.
+  - **Send:** the manager proposes an exit to a 1Click deposit address; it's public for 24h, then the vault signs one transfer.
+  - **Arrive:** anyone can call `unwrap_and_repatriate` to credit the delivered NEAR to holders.
+  - **Status:** the vault page shows a live 1Click quote for the vault's holdings. NEAR Intents is mainnet-only, so the send half is built and tested but runs on mainnet; the arrival half ran live on testnet.
 - **Attested** (working on testnet; switched on once strategy v2 is applied Sat 14 Nov): only TDX-attested output delivered on-chain can commit, trade, settle or prove. The vault calls OutLayer's `request_execution` itself, and only DCAP-verified workers can answer. Commitment #18 was created by the vault's own callback this way, with its Bulletproofs anchored from the enclave's delivery. Switching it on is immediate; switching back takes 48h.
 
 Every finding, fix and regression test, plus the residual risks, is in [`docs/SECURITY.md`](docs/SECURITY.md).

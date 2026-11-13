@@ -80,6 +80,10 @@ storage.
 - **Attested mode works, but isn't switched on until strategy v2 applies (Sat 14 Nov).** We had blamed OutLayer's testnet worker for never answering on-chain calls. The real cause was ours: `request_decision` passed empty `resource_limits`, and OutLayer's default budget (1e9 instructions) aborts the strategy mid-Bulletproof (it needs ~2.3e9). With an explicit 5e9 budget the vault's own on-chain path works (commitment #18, ~20s round trip).
 - **Market inputs are supplied by the requester, even in attested mode.** The contract checks the vault-state part of the input but not prices or balances. The browser's price check compares each published input against public market history. The next step is an enclave that fetches its own prices (wasip2 HTTP).
 - **Front-running window:** the decision becomes public when it is revealed (or delivered, in attested mode), shortly before the swap lands. The enclave's 2% floor and the 1h deadline bound the loss. On mainnet, submit through a private mempool.
-- **Cross-chain funds depend on NEAR's MPC network** to ever move, and have no on-chain bridge back (repatriation is a manual sale and bridge followed by `repatriate`).
+- **Cross-chain funds depend on NEAR's MPC network** to ever move. **The way back is NEAR Intents**:
+  - **Send half.** The manager proposes an exit naming a 1Click deposit address. It is public for 24h; then the vault signs one USDC transfer to it.
+  - **Arrival half.** `unwrap_and_repatriate` (anyone) unwraps the delivered wNEAR and credits holders.
+  - **What the contract can't verify.** It can't see inside a 1Click quote, so a manager could name a deposit address that doesn't pay the vault. The 24h delay, the public 1Click status link and the proposer binding are the defence; the order lapses if the NFT is sold.
+  - **Mainnet only for the send half.** NEAR Intents has no testnet, so only the arrival half has run live, using a wrap.testnet stand-in for the delivery.
 - **Sepolia pools are mispriced** (~10–14× real ETH). The enclave's oracle-based floor makes swaps into a bad pool unfillable; the executor checks the quote and refuses before spending gas.
 - **No rate limit** on relayed calls beyond the 1h settlement spacing. Each write is self-funded (storage), so spam costs the spammer.

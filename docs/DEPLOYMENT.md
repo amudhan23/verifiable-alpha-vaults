@@ -133,3 +133,14 @@ Found during the rehearsal, and fixed on both vaults before Saturday:
 - **Gas cap.** The v5 per-leg cap of 120k gas was too low for Sepolia WETH's `approve` (the wrap alone uses 133k). Wrap and approve are now capped at 250k.
 - **Pool direction.** Sepolia's ETH/USDC pool prices ETH about 10× *above* the oracle, not below. Buys can never meet the enclave's 2% floor; sells fill well above it (0.01308 ETH returned about 422 USDC).
 - **Secrets whitelist cache.** OutLayer serves a newly whitelisted caller only after a few minutes. Requests made before that time out without an answer.
+
+## The way back: NEAR Intents (13 Nov)
+
+- **Live quote** from NEAR Intents' 1Click API for the vault wallet's holdings: 57.94 USDC on Ethereum → 16.48 NEAR in about 45s (dry run). `node executor/intents.mjs quote`.
+- **Contract:**
+  - `propose_exit(deposit_address, amount_usdc, quote_ref)`: manager only, public for 24h, lapses if the NFT is sold.
+  - `sign_exit_tx(...)`: executor, after the delay. Signs one USDC `transfer` to that address, capped at 120k gas.
+  - `unwrap_and_repatriate()`: anyone. Reads the vault's wNEAR balance, calls `near_withdraw`, and credits holders like `repatriate`.
+  - Tests: 25 unit tests, with 2 new ones for this leg.
+- **Live on testnet:** the arrival half ran on the main vault. A wrap.testnet `ft_transfer` stood in for the Intents delivery (tx `Aef66ZUY…`), then `unwrap_and_repatriate` (tx `AFfuBsgvysevy8JVU5YRRB73ie5y14G5PubfqZ99kZUK`) unwrapped 0.04875 NEAR and credited it to the pool.
+- **Mainnet only:** the send half (a real 1Click deposit address) needs mainnet, because NEAR Intents has no testnet deployment.

@@ -211,6 +211,7 @@ async function renderVault(id) {
     ${v.live ? `<div class="panel position" id="position"><h3>Your position</h3><p class="muted">Loading wallet…</p></div>` : ""}
     ${v.emergency ? `<div class="alert"><b>Emergency exit mode.</b> No attested decision for over ${Math.round(v.liveness_timeout_ms / 3.6e6)}h. Trading is frozen; withdrawals pay your share of the local pool now and record a claim on cross-chain value.</div>` : ""}
     ${v.pending_strategy ? `<div class="alert notice"><b>Strategy change proposed.</b> New code <span class="hash">${short(v.pending_strategy.hash)}</span> can take over ${new Date(v.pending_strategy.effective_at_ms) > new Date() ? `from ${new Date(v.pending_strategy.effective_at_ms).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}` : "now: anyone can apply it"}. Changes to what code runs are public for 48 hours first, so you can leave before they apply.</div>` : ""}
+    ${v.exit ? `<div class="alert notice"><b>Exit to NEAR proposed.</b> ${(Number(v.exit.amount_usdc) / 1e6).toFixed(2)} USDC goes to NEAR Intents deposit address <span class="hash">${short(v.exit.deposit_address)}</span>, ${v.exit.signed ? "signed and sent." : new Date(v.exit.effective_at_ms) > new Date() ? `signable from ${new Date(v.exit.effective_at_ms).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}.` : "signable now."} Check that its recipient is this vault: <a href="https://1click.chaindefuser.com/v0/status?depositAddress=${encodeURIComponent(v.exit.deposit_address)}" target="_blank" rel="noopener">1Click status</a>.</div>` : ""}
     ${v.integrity_alert ? `<div class="alert"><b>Integrity alert — deposits paused.</b> A decision arrived attested to different code: <code>${esc(v.integrity_alert)}</code></div>` : ""}
     <div class="cols">
       <div class="panel"><h3>Net asset value${v.return_pct == null ? "" : ` · ${fmtPct(v.return_pct)} per share`}</h3>${navChart(v)}${v.external_near > 0 ? `<p class="muted" style="font-size:12.5px; font-style:italic; margin:8px 0 0">The step up is the vault’s cross-chain wallet being valued for the first time. The manager funded that wallet and holds every share, so this is a valuation report, not a realized return: no fee can be charged on it until it comes back as NEAR.</p>` : ""}</div>
@@ -227,6 +228,7 @@ async function renderVault(id) {
           ${v.last_attested_ms ? `<dt>exit guarantee</dt><dd style="font-size:11.5px">${v.emergency ? "EMERGENCY — withdraw pro rata" : `anyone may trigger exit if silent ${Math.round(v.liveness_timeout_ms / 3.6e6)}h (last: ${when(v.last_attested_ms)})`}</dd>` : ""}
           ${v.mode ? `<dt>trust mode</dt><dd>${v.mode === "Attested" ? "attested: only TDX-delivered output can act" : `relayed by <span title="openly trusted to deliver enclave output on time">${esc(v.executor ?? "executor")}</span>`}</dd>` : ""}
           <dt>perf fee</dt><dd>20% of realized gains above high-water mark</dd>
+          ${v.live && v.evm_address ? `<dt>way back</dt><dd id="way-back">NEAR Intents: cross-chain USDC returns as NEAR</dd>` : ""}
           <dt>manager</dt><dd title="holder of the strategy NFT">${esc(v.manager)}</dd>
         </dl>
         <p class="muted" style="font-size:12.5px; margin:10px 0 0">The sealed strategy decides <em>what</em> to trade; it cannot decide to exceed these. A breach is refused before any signature exists.</p>
@@ -259,7 +261,30 @@ async function mountPosition(v) {
     box.innerHTML = `<h3>Your position</h3><p class="muted">Wallet unavailable: ${esc(e.message)}</p>`;
     return;
   }
+  loadWayBack(v);
   await renderPosition(v);
+}
+
+/** Live NEAR Intents (1Click) dry-run quote for the vault wallet's USDC -> NEAR.
+ * NEAR Intents is mainnet-only, so a testnet vault is priced on the same
+ * mainnet route (Ethereum USDC -> NEAR); the label says so. */
+async function loadWayBack(v) {
+  const el = document.getElementById("way-back");
+  if (!el) return;
+  try {
+    const bal = await fetch("https://ethereum-sepolia-rpc.publicnode.com", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238", data: "0x70a08231" + v.evm_address.slice(2).toLowerCase().padStart(64, "0") }, "latest"] }) }).then((r) => r.json());
+    const usdc = BigInt(bal.result || "0x0");
+    if (usdc === 0n) { el.textContent = "NEAR Intents: nothing cross-chain to bring back right now"; return; }
+    const q = await fetch("https://1click.chaindefuser.com/v0/quote", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ dry: true, swapType: "EXACT_INPUT", slippageTolerance: 100, originAsset: "nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near",
+        depositType: "ORIGIN_CHAIN", destinationAsset: "nep141:wrap.near", amount: usdc.toString(), refundTo: v.evm_address, refundType: "ORIGIN_CHAIN",
+        recipient: v.id.endsWith(".near") ? v.id : "wrap.near", recipientType: "DESTINATION_CHAIN", deadline: new Date(Date.now() + 3600e3).toISOString() }) }).then((r) => r.json());
+    if (!q.quote) throw new Error(q.message || "no quote");
+    el.innerHTML = `NEAR Intents, live quote: ${esc(q.quote.amountInFormatted)} USDC → <b>${Number(q.quote.amountOutFormatted).toFixed(2)} NEAR</b> in ~${q.quote.timeEstimate}s${v.id.endsWith(".near") ? "" : ` <span class="muted" title="NEAR Intents has no testnet; this is the same route on mainnet">(mainnet route; testnet vault)</span>`}`;
+  } catch {
+    el.textContent = "NEAR Intents: cross-chain USDC returns as NEAR (quote unavailable right now)";
+  }
 }
 
 async function renderPosition(v) {

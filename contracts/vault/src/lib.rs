@@ -83,6 +83,11 @@ pub const MIN_SETTLE_INTERVAL_MS: u64 = 3_600_000;
 pub const ATTESTED_STORAGE_RESERVE: u128 = ONE_NEAR / 10;
 /// A swap's deadline must fall within this window from now.
 pub const MAX_DEADLINE_S: u64 = 3_600;
+/// An exit (cross-chain value back to NEAR via NEAR Intents) is public this
+/// long before the vault will sign it.
+pub const EXIT_DELAY_MS: u64 = 24 * 3_600_000;
+const GAS_CAP_EXIT: u64 = 120_000;
+const EXIT_KEY: &[u8] = b"exit";
 const NAV_LOG_CAP: u32 = 2_000;
 /// Fixed unit count created with the first external value (1e24): with
 /// ACC_SCALE 1e24, repatriations up to ~1e14 NEAR stay inside u128.
@@ -329,6 +334,22 @@ pub struct Proposal {
     /// Bound to whoever proposed it: if the strategy NFT changes hands, a
     /// pending proposal can no longer be applied.
     pub proposer: AccountId,
+}
+
+/// One pending exit: send `amount` USDC (6dp) from the vault's EVM wallet to
+/// a NEAR Intents (1Click) deposit address whose quote pays NEAR to this
+/// vault. The contract can't see inside the quote, so the order is public for
+/// 24h first: anyone can check the address with 1Click's status API (its
+/// recipient must be this vault) and leave before it is signed.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug)]
+pub struct ExitOrder {
+    pub deposit_address: String,
+    pub amount_usdc: U128,
+    pub quote_ref: String,
+    pub effective_at_ms: u64,
+    pub proposer: AccountId,
+    pub signed: bool,
 }
 
 #[near(serializers = [borsh, json])]
@@ -637,8 +658,14 @@ impl Vault {
     pub fn repatriate(&mut self) {
         let r = env::attached_deposit().as_yoctonear();
         require!(r > 0, "attach the repatriated NEAR");
-        require!(self.ext_units_total > 0, "no external units outstanding");
-        require!(self.ext_units_total >= EXT_UNITS_BASE / 1_000, "external units too few to distribute safely");
+        if let Err(e) = self.credit_repatriation(r) {
+            env::panic_str(&e);
+        }
+    }
+
+    fn credit_repatriation(&mut self, r: u128) -> Result<(), String> {
+        if self.ext_units_total == 0 { return Err("no external units outstanding".into()); }
+        if self.ext_units_total < EXT_UNITS_BASE / 1_000 { return Err("external units too few to distribute safely".into()); }
         let to_vault = mul_div(r, self.vault_ext_units, self.ext_units_total);
         self.pool += to_vault;
         self.ext_acc += mul_div(r, ACC_SCALE, self.ext_units_total);
@@ -646,6 +673,124 @@ impl Vault {
         self.repatriated_total += r;
         self.record_nav();
         emit("repatriated", serde_json::json!({"amount": r.to_string(), "to_pool": to_vault.to_string()}));
+        Ok(())
+    }
+
+    // ==================================================================
+    // The way back: cross-chain value -> NEAR via NEAR Intents
+    // ==================================================================
+
+    fn wrap_account() -> AccountId {
+        let me = env::current_account_id();
+        (if me.as_str().ends_with(".testnet") { "wrap.testnet" } else { "wrap.near" }).parse().unwrap()
+    }
+
+    pub fn get_exit(&self) -> Option<ExitOrder> {
+        env::storage_read(EXIT_KEY).and_then(|b| near_sdk::borsh::from_slice(&b).ok())
+    }
+
+    fn put_exit(&mut self, e: Option<&ExitOrder>) {
+        match e {
+            Some(e) => { env::storage_write(EXIT_KEY, &near_sdk::borsh::to_vec(e).unwrap()); }
+            None => { env::storage_remove(EXIT_KEY); }
+        }
+    }
+
+    /// Manager: name a 1Click deposit address (from a NEAR Intents quote whose
+    /// recipient is this vault) and the USDC to send. Signable after 24h.
+    #[payable]
+    pub fn propose_exit(&mut self, deposit_address: String, amount_usdc: U128, quote_ref: String) {
+        self.assert_manager();
+        let before = env::storage_usage();
+        require!(!self.emergency, "vault is in emergency exit mode");
+        let _ = parse_evm_address(&deposit_address);
+        require!(amount_usdc.0 > 0, "nothing to send");
+        require!(quote_ref.len() <= MAX_REF, "quote_ref too long");
+        let e = ExitOrder {
+            deposit_address, amount_usdc, quote_ref,
+            effective_at_ms: env::block_timestamp_ms() + EXIT_DELAY_MS,
+            proposer: env::predecessor_account_id(), signed: false,
+        };
+        emit("exit_proposed", serde_json::json!({"deposit_address": e.deposit_address, "amount_usdc": e.amount_usdc, "quote_ref": e.quote_ref, "effective_at_ms": e.effective_at_ms}));
+        self.put_exit(Some(&e));
+        self.charge_storage(before);
+    }
+
+    pub fn cancel_exit(&mut self) {
+        self.assert_manager();
+        self.put_exit(None);
+        emit("exit_cancelled", serde_json::json!({}));
+    }
+
+    /// Executor: after the delay, the vault signs exactly one USDC transfer to
+    /// the proposed deposit address.
+    #[payable]
+    pub fn sign_exit_tx(&mut self, nonce: u64, max_fee_per_gas: U128, max_priority_fee_per_gas: U128, gas_limit: u64) -> Promise {
+        self.assert_executor();
+        let mut e = self.get_exit().unwrap_or_else(|| env::panic_str("no exit proposed"));
+        require!(!e.signed, "this exit was already signed");
+        require!(env::block_timestamp_ms() >= e.effective_at_ms, "exit timelock not elapsed");
+        require!(self.manager_account() == e.proposer, "proposer no longer holds the strategy NFT");
+        require!(max_fee_per_gas.0 <= MAX_FEE_PER_GAS, "max_fee_per_gas above cap");
+        require!(max_priority_fee_per_gas.0 <= max_fee_per_gas.0, "priority fee above max fee");
+        require!(gas_limit <= GAS_CAP_EXIT, "gas_limit above the exit cap");
+        let before = env::storage_usage();
+        let mut data = hex::decode("a9059cbb").unwrap(); // transfer(address,uint256)
+        data.extend(evm::word_addr(&parse_evm_address(&e.deposit_address)));
+        data.extend(evm::word_u128(e.amount_usdc.0));
+        let tx = evm::Tx1559 {
+            chain_id: EVM_CHAIN_ID, nonce,
+            max_priority_fee_per_gas: max_priority_fee_per_gas.0, max_fee_per_gas: max_fee_per_gas.0,
+            gas_limit, to: USDC, value: 0, data,
+        };
+        let payload_hex = hex::encode(env::keccak256(&tx.signing_bytes()));
+        e.signed = true;
+        self.put_exit(Some(&e));
+        let key = format!("exit:{}", e.deposit_address);
+        emit("evm_sign_requested", serde_json::json!({"leg": "exit", "nonce": nonce, "payload": payload_hex}));
+        let storage = self.storage_cost(before);
+        let att = env::attached_deposit().as_yoctonear();
+        require!(att > storage, "attach enough for storage plus the MPC signing fee");
+        let args = serde_json::json!({"request": {"payload_v2": {"Ecdsa": payload_hex}, "path": self.mpc_path, "domain_id": 0}});
+        Promise::new(MPC_SIGNER.parse().unwrap())
+            .function_call("sign".to_string(), args.to_string().into_bytes(), NearToken::from_yoctonear(att - storage), Gas::from_tgas(200))
+            .then(Self::ext(env::current_account_id()).with_static_gas(Gas::from_tgas(15)).on_signed(key, payload_hex))
+    }
+
+    /// Anyone: NEAR Intents delivers wNEAR to the vault. Unwrap everything the
+    /// vault holds and credit it to holders exactly like `repatriate`.
+    pub fn unwrap_and_repatriate(&mut self) -> Promise {
+        Promise::new(Self::wrap_account())
+            .function_call("ft_balance_of".to_string(), serde_json::json!({"account_id": env::current_account_id()}).to_string().into_bytes(), NearToken::from_yoctonear(0), Gas::from_tgas(5))
+            .then(Self::ext(env::current_account_id()).with_static_gas(Gas::from_tgas(40)).on_wrap_balance())
+    }
+
+    #[private]
+    pub fn on_wrap_balance(&mut self, #[callback_result] bal: Result<U128, near_sdk::PromiseError>) -> PromiseOrValue<U128> {
+        let bal = bal.map(|b| b.0).unwrap_or(0);
+        if bal == 0 {
+            emit("unwrap_skipped", serde_json::json!({"reason": "no wNEAR held"}));
+            return PromiseOrValue::Value(U128(0));
+        }
+        PromiseOrValue::Promise(
+            Promise::new(Self::wrap_account())
+                .function_call("near_withdraw".to_string(), serde_json::json!({"amount": bal.to_string()}).to_string().into_bytes(), NearToken::from_yoctonear(1), Gas::from_tgas(10))
+                .then(Self::ext(env::current_account_id()).with_static_gas(Gas::from_tgas(15)).on_unwrapped(U128(bal))),
+        )
+    }
+
+    #[private]
+    pub fn on_unwrapped(&mut self, amount: U128) -> U128 {
+        if !matches!(env::promise_result(0), PromiseResult::Successful(_)) {
+            emit("unwrap_failed", serde_json::json!({"amount": amount}));
+            return U128(0);
+        }
+        if let Err(e) = self.credit_repatriation(amount.0) {
+            // NEAR is held but can't be attributed yet; stays in the contract
+            emit("unwrap_uncredited", serde_json::json!({"amount": amount, "reason": e}));
+            return U128(0);
+        }
+        amount
     }
 
     /// Pay out the caller's accrued share of repatriated NEAR.
@@ -1325,6 +1470,7 @@ impl Vault {
             "mode": self.mode,
             "pending_relayed": self.pending_relayed,
             "pending_code": self.pending_code,
+            "exit": self.get_exit(),
             "deposits_open": !self.emergency && !self.deposits_paused && self.ext_value == 0,
             "commitments": self.commitments.len(),
             "risk_proofs": self.risk_proofs.len(),
